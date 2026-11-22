@@ -1,0 +1,18 @@
+{
+  "company": {
+    "name": "SARL ADVANCED SECURITY SYSTEMS",
+    "shortName": "Advanced Security Systems",
+    "address": "LOC N°A RUE ABANE RAMDANE, CLASSE 75, TIZI OUZOU",
+    "rc": "22B0051898",
+    "ai": "15017178011",
+    "nif": "002215005189811",
+    "nis": "002215010027368",
+    "tin": "00015547",
+    "email": "ads.services23@gmail.com",
+    "phone": "0661 66 68 48",
+    "bank": "",
+    "currency": "DA",
+    "vat": 19
+  },
+  "demoMode": true
+}

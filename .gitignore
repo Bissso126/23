@@ -1,0 +1,10 @@
+# Données locales — la base vit sur le disque Render (/var/data)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+node_modules/
+*.log
+.env
+.env.*

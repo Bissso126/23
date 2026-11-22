@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: ass-erp
+    runtime: node
+    # Le disque persistant exige une offre payante (Starter ou plus).
+    plan: starter
+    region: frankfurt
+    buildCommand: npm install --omit=dev --no-audit --no-fund
+    startCommand: node server.js
+    healthCheckPath: /api/public/config
+    autoDeployTrigger: commit
+    envVars:
+      # Render impose une écoute sur 0.0.0.0 ; PORT est fourni par Render.
+      - key: HOST
+        value: 0.0.0.0
+      # Disque persistant : seule cette arborescence survit aux redéploiements.
+      - key: DATA_DIR
+        value: /var/data
+      # Pas de comptes de démonstration sur un serveur public.
+      - key: SEED_DEMO
+        value: "0"
+      - key: ADMIN_EMAIL
+        value: admin@ass.dz
+      # À saisir dans le tableau de bord Render (valeur secrète, jamais dans le dépôt).
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+    disk:
+      name: ass-data
+      mountPath: /var/data
+      sizeGB: 1
