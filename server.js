@@ -1,6 +1,6 @@
 /* ============================================================
    ADVANCE SECURITY SYSTEM — BACKEND
-   Node.js + SQLite (node:sqlite) — zéro dépendance externe
+   Node.js + SQLite (libSQL / Turso) — une dépendance : @libsql/client
    API REST + sessions + rôles
    ============================================================ */
 'use strict';
@@ -9,7 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { db, initDb } = require('./db');
 
 let CONFIG = {};
 try { CONFIG = require('./config.json'); } catch { CONFIG = {}; }
@@ -43,12 +43,14 @@ const PUBLIC = path.join(ROOT, 'public');
 const DATA_DIR = process.env.DATA_DIR || (process.env.VERCEL ? '/tmp/ass-data' : path.join(ROOT, 'data'));
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new DatabaseSync(path.join(DATA_DIR, 'ass.db'));
-
 /* ---------------- SCHEMA ---------------- */
-db.exec(`
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+/* PRAGMA exécutés séparément : sur une réplica Turso, un PRAGMA refusé ne
+   doit pas empêcher la création du schéma. */
+const PRAGMAS = [
+  'PRAGMA journal_mode = WAL;',
+  'PRAGMA foreign_keys = ON;',
+];
+const SCHEMA = `
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE, pass TEXT,
@@ -143,51 +145,51 @@ CREATE TABLE IF NOT EXISTS sequences (
 CREATE TABLE IF NOT EXISTS services (
   code TEXT PRIMARY KEY, nom TEXT, couleur TEXT, ordre INTEGER, actif INTEGER DEFAULT 1
 );
-`);
+`;
 
 /* ---------------- MIGRATIONS ---------------- */
-function ensureColumn(table, col, type) {
+async function ensureColumn(table, col, type) {
   try {
-    const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-    if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    const cols = (await db.prepare(`PRAGMA table_info(${table})`).all());
+    if (!cols.some((c) => c.name === col)) (await db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`));
   } catch (e) {
     console.error('[MIGRATION]', table, col, e.message);
   }
 }
-ensureColumn('clients', 'nis', 'TEXT');
-ensureColumn('clients', 'tin', 'TEXT');
-ensureColumn('factures', 'objet', 'TEXT');
-ensureColumn('factures', 'modePaiement', 'TEXT');
-ensureColumn('contrats', 'periodicite', 'TEXT');
-ensureColumn('contrats', 'prochaineFacture', 'TEXT');
-ensureColumn('contrats', 'sla', 'TEXT');
-ensureColumn('contrats', 'sites', 'TEXT');
-ensureColumn('users', 'salaire', 'REAL');
-ensureColumn('users', 'perms', 'TEXT'); // JSON : modules autorisés ([] ou NULL = selon le rôle)
-ensureColumn('sessions', 'expires', 'TEXT');
-ensureColumn('sessions', 'agent', 'TEXT');
-ensureColumn('factures', 'lignes', 'TEXT'); // instantané des lignes au moment de la facturation
-ensureColumn('factures', 'tva', 'REAL DEFAULT 19');
-ensureColumn('clients', 'notes', 'TEXT');
-ensureColumn('devis', 'remise', 'REAL DEFAULT 0');
-/* Paie / pointage manuel */
-ensureColumn('pointages', 'date', 'TEXT');
-ensureColumn('pointages', 'heuresSup', 'REAL DEFAULT 0');
-ensureColumn('pointages', 'deplacement', 'INTEGER DEFAULT 0');
-ensureColumn('pointages', 'montant', 'REAL DEFAULT 0');
-ensureColumn('pointages', 'note', 'TEXT');
-ensureColumn('pointages', 'horsWilaya', 'INTEGER DEFAULT 0');
-ensureColumn('pointages', 'mission', 'TEXT');
-/* Pôles / services : chaque stock, vente et achat est rattaché à une activité */
-ensureColumn('stock', 'service', 'TEXT');
-ensureColumn('mouvements', 'service', 'TEXT');
-ensureColumn('devis', 'service', 'TEXT');
-ensureColumn('factures', 'service', 'TEXT');
-ensureColumn('factures_achat', 'service', 'TEXT');
-ensureColumn('projets', 'service', 'TEXT');
-ensureColumn('equipements', 'service', 'TEXT');
-ensureColumn('contrats', 'service', 'TEXT');
-ensureColumn('users', 'services', 'TEXT'); // JSON : pôles autorisés ([] ou NULL = tous)
+const MIGRATIONS = [
+  ['clients', 'nis', 'TEXT'],
+  ['clients', 'tin', 'TEXT'],
+  ['factures', 'objet', 'TEXT'],
+  ['factures', 'modePaiement', 'TEXT'],
+  ['contrats', 'periodicite', 'TEXT'],
+  ['contrats', 'prochaineFacture', 'TEXT'],
+  ['contrats', 'sla', 'TEXT'],
+  ['contrats', 'sites', 'TEXT'],
+  ['users', 'salaire', 'REAL'],
+  ['users', 'perms', 'TEXT'],
+  ['sessions', 'expires', 'TEXT'],
+  ['sessions', 'agent', 'TEXT'],
+  ['factures', 'lignes', 'TEXT'],
+  ['factures', 'tva', 'REAL DEFAULT 19'],
+  ['clients', 'notes', 'TEXT'],
+  ['devis', 'remise', 'REAL DEFAULT 0'],
+  ['pointages', 'date', 'TEXT'],
+  ['pointages', 'heuresSup', 'REAL DEFAULT 0'],
+  ['pointages', 'deplacement', 'INTEGER DEFAULT 0'],
+  ['pointages', 'montant', 'REAL DEFAULT 0'],
+  ['pointages', 'note', 'TEXT'],
+  ['pointages', 'horsWilaya', 'INTEGER DEFAULT 0'],
+  ['pointages', 'mission', 'TEXT'],
+  ['stock', 'service', 'TEXT'],
+  ['mouvements', 'service', 'TEXT'],
+  ['devis', 'service', 'TEXT'],
+  ['factures', 'service', 'TEXT'],
+  ['factures_achat', 'service', 'TEXT'],
+  ['projets', 'service', 'TEXT'],
+  ['equipements', 'service', 'TEXT'],
+  ['contrats', 'service', 'TEXT'],
+  ['users', 'services', 'TEXT'],
+];
 
 /* ---------------- PÔLES / SERVICES (stock, ventes et achats séparés) ---------------- */
 const SERVICES = [
@@ -250,11 +252,11 @@ function filterByService(rows, u) {
   return rows.filter((r) => list.indexOf(serviceOf(r)) !== -1);
 }
 /* Un mouvement et toutes ses lignes doivent appartenir au même pôle */
-function checkMvtService(m) {
+async function checkMvtService(m) {
   const svc = serviceOf(m);
   for (const l of parseLignesMvt(m.lignes)) {
     if (!l.stockId) continue;
-    const s = db.prepare('SELECT nom, service FROM stock WHERE id = ?').get(l.stockId);
+    const s = (await db.prepare('SELECT nom, service FROM stock WHERE id = ?').get(l.stockId));
     if (!s) continue;
     if (serviceOf(s) !== svc) {
       return `L'article « ${s.nom || l.designation || 'article'} » appartient au pôle ${serviceName(serviceOf(s))} : il ne peut pas figurer sur un mouvement du pôle ${serviceName(svc)}`;
@@ -262,22 +264,22 @@ function checkMvtService(m) {
   }
   return null;
 }
-function serviceFromLignes(raw) {
+async function serviceFromLignes(raw) {
   for (const l of parseLignesMvt(raw)) {
     if (!l.stockId) continue;
-    const s = db.prepare('SELECT service FROM stock WHERE id = ?').get(l.stockId);
+    const s = (await db.prepare('SELECT service FROM stock WHERE id = ?').get(l.stockId));
     if (s) return serviceOf(s);
   }
   return null;
 }
 /* Synthèse ventes / achats / stock / facturation par pôle */
-function servicesSynthese(mois, u) {
-  const services = db.prepare('SELECT * FROM services WHERE COALESCE(actif,1) = 1 ORDER BY ordre').all();
+async function servicesSynthese(mois, u) {
+  const services = (await db.prepare('SELECT * FROM services WHERE COALESCE(actif,1) = 1 ORDER BY ordre').all());
   const inMois = (d) => !mois || String(d || '').slice(0, 7) === mois;
-  const stock = filterByService(db.prepare('SELECT * FROM stock').all(), u);
-  const mvts = filterByService(db.prepare('SELECT * FROM mouvements').all(), u);
-  const factures = filterByService(db.prepare('SELECT * FROM factures').all(), u);
-  const achats = filterByService(db.prepare('SELECT * FROM factures_achat').all(), u);
+  const stock = filterByService((await db.prepare('SELECT * FROM stock').all()), u);
+  const mvts = filterByService((await db.prepare('SELECT * FROM mouvements').all()), u);
+  const factures = filterByService((await db.prepare('SELECT * FROM factures').all()), u);
+  const achats = filterByService((await db.prepare('SELECT * FROM factures_achat').all()), u);
   const list = userServices(u);
   return services
     .filter((s) => !list || list.indexOf(s.code) !== -1)
@@ -306,36 +308,39 @@ function servicesSynthese(mois, u) {
       };
     });
 }
-function seedServices() {
+async function seedServices() {
   const ins = db.prepare('INSERT OR IGNORE INTO services (code,nom,couleur,ordre,actif) VALUES (?,?,?,?,1)');
-  SERVICES.forEach((s, i) => ins.run(s.code, s.nom, s.couleur, i));
+  for (let i = 0; i < SERVICES.length; i++) {
+    const s = SERVICES[i];
+    await ins.run(s.code, s.nom, s.couleur, i);
+  }
 }
 /* Reprise des données existantes : pôle déduit de la catégorie ou des lignes */
-function backfillServices() {
-  db.prepare('SELECT id, cat, service FROM stock').all().forEach((s) => {
-    if (normalizeService(s.service)) return;
-    db.prepare('UPDATE stock SET service = ? WHERE id = ?').run(normalizeService(s.cat) || DEFAULT_SERVICE, s.id);
-  });
-  db.prepare('SELECT id, cat, service FROM equipements').all().forEach((e) => {
-    if (normalizeService(e.service)) return;
-    db.prepare('UPDATE equipements SET service = ? WHERE id = ?').run(normalizeService(e.cat) || DEFAULT_SERVICE, e.id);
-  });
-  db.prepare('SELECT id, lignes, service FROM mouvements').all().forEach((m) => {
-    if (normalizeService(m.service)) return;
-    db.prepare('UPDATE mouvements SET service = ? WHERE id = ?').run(serviceFromLignes(m.lignes) || DEFAULT_SERVICE, m.id);
-  });
-  db.prepare('SELECT id, devisId, service FROM factures').all().forEach((f) => {
-    if (normalizeService(f.service)) return;
-    const d = f.devisId ? db.prepare('SELECT service FROM devis WHERE id = ?').get(f.devisId) : null;
-    db.prepare('UPDATE factures SET service = ? WHERE id = ?').run((d && normalizeService(d.service)) || DEFAULT_SERVICE, f.id);
-  });
-  ['devis', 'factures_achat', 'projets', 'contrats'].forEach((t) => {
-    db.prepare(`SELECT id, service FROM ${t}`).all().forEach((r) => {
-      if (!normalizeService(r.service)) db.prepare(`UPDATE ${t} SET service = ? WHERE id = ?`).run(DEFAULT_SERVICE, r.id);
-    });
-  });
+async function backfillServices() {
+  for (const s of (await db.prepare('SELECT id, cat, service FROM stock').all())) {
+    if (normalizeService(s.service)) continue;
+    await db.prepare('UPDATE stock SET service = ? WHERE id = ?').run(normalizeService(s.cat) || DEFAULT_SERVICE, s.id);
+  }
+  for (const e of (await db.prepare('SELECT id, cat, service FROM equipements').all())) {
+    if (normalizeService(e.service)) continue;
+    await db.prepare('UPDATE equipements SET service = ? WHERE id = ?').run(normalizeService(e.cat) || DEFAULT_SERVICE, e.id);
+  }
+  for (const m of (await db.prepare('SELECT id, lignes, service FROM mouvements').all())) {
+    if (normalizeService(m.service)) continue;
+    await db.prepare('UPDATE mouvements SET service = ? WHERE id = ?').run((await serviceFromLignes(m.lignes)) || DEFAULT_SERVICE, m.id);
+  }
+  for (const f of (await db.prepare('SELECT id, devisId, service FROM factures').all())) {
+    if (normalizeService(f.service)) continue;
+    const d = f.devisId ? (await db.prepare('SELECT service FROM devis WHERE id = ?').get(f.devisId)) : null;
+    await db.prepare('UPDATE factures SET service = ? WHERE id = ?').run((d && normalizeService(d.service)) || DEFAULT_SERVICE, f.id);
+  }
+  for (const t of ['devis', 'factures_achat', 'projets', 'contrats']) {
+    for (const r of (await db.prepare(`SELECT id, service FROM ${t}`).all())) {
+      if (!normalizeService(r.service)) await db.prepare(`UPDATE ${t} SET service = ? WHERE id = ?`).run(DEFAULT_SERVICE, r.id);
+    }
+  }
+  await db.exec("UPDATE pointages SET date = substr(ts,1,10) WHERE (date IS NULL OR date = '') AND ts IS NOT NULL AND ts <> ''");
 }
-try { db.exec("UPDATE pointages SET date = substr(ts,1,10) WHERE (date IS NULL OR date = '') AND ts IS NOT NULL AND ts <> ''"); } catch {}
 
 /* ---------------- DOSSIER DE TRANSMISSION DE L'ENTREPRISE ---------------- */
 function dossierTable(headers, rows) {
@@ -344,7 +349,7 @@ function dossierTable(headers, rows) {
     rows.map((r) => '<tr>' + r.map((c) => `<td>${c == null || c === '' ? '—' : h(c)}</td>`).join('') + '</tr>').join('') +
     '</tbody></table>';
 }
-function renderDossierHtml(req, me) {
+async function renderDossierHtml(req, me) {
   const co = CONFIG.company;
   const today = new Date();
   const dateFr = today.toLocaleDateString('fr-FR', { day: '2-digit', month: 'long', year: 'numeric' });
@@ -353,15 +358,15 @@ function renderDossierHtml(req, me) {
   const host = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000').split(',')[0];
   const appUrl = `${proto}://${host}`;
 
-  const clients = db.prepare('SELECT * FROM clients ORDER BY name').all();
-  const devis = db.prepare('SELECT * FROM devis ORDER BY date DESC').all().map(getDevis);
-  const factures = db.prepare('SELECT * FROM factures ORDER BY date DESC').all();
-  const achats = db.prepare('SELECT * FROM factures_achat ORDER BY date DESC').all();
-  const mouvements = db.prepare('SELECT * FROM mouvements ORDER BY date DESC').all();
-  const stock = db.prepare('SELECT * FROM stock ORDER BY nom').all();
-  const depenses = db.prepare('SELECT * FROM depenses ORDER BY date DESC').all();
-  const contrats = db.prepare('SELECT * FROM contrats ORDER BY dateDep DESC').all();
-  const users = db.prepare('SELECT id,name,email,role,phone,active,perms,services,created FROM users ORDER BY name').all();
+  const clients = (await db.prepare('SELECT * FROM clients ORDER BY name').all());
+  const devis = await Promise.all((await db.prepare('SELECT * FROM devis ORDER BY date DESC').all()).map(getDevis));
+  const factures = (await db.prepare('SELECT * FROM factures ORDER BY date DESC').all());
+  const achats = (await db.prepare('SELECT * FROM factures_achat ORDER BY date DESC').all());
+  const mouvements = (await db.prepare('SELECT * FROM mouvements ORDER BY date DESC').all());
+  const stock = (await db.prepare('SELECT * FROM stock ORDER BY nom').all());
+  const depenses = (await db.prepare('SELECT * FROM depenses ORDER BY date DESC').all());
+  const contrats = (await db.prepare('SELECT * FROM contrats ORDER BY dateDep DESC').all());
+  const users = (await db.prepare('SELECT id,name,email,role,phone,active,perms,services,created FROM users ORDER BY name').all());
   const clientName = (id) => (clients.find((c) => c.id === id) || {}).name || '—';
   const svc = (r) => serviceOf(r);
 
@@ -517,14 +522,14 @@ function soldeCaisse(rows) {
 }
 
 /* Feuille de salaire calculée depuis les pointages d'un mois (ou de toutes les périodes). */
-function salairesPointage(mois) {
-  const users = db.prepare('SELECT id,name,role,active,salaire FROM users ORDER BY name').all();
+async function salairesPointage(mois) {
+  const users = (await db.prepare('SELECT id,name,role,active,salaire FROM users ORDER BY name').all());
   const pts = mois
-    ? db.prepare("SELECT * FROM pointages WHERE substr(COALESCE(date, substr(ts,1,10)),1,7) = ?").all(mois)
-    : db.prepare('SELECT * FROM pointages').all();
+    ? (await db.prepare("SELECT * FROM pointages WHERE substr(COALESCE(date, substr(ts,1,10)),1,7) = ?").all(mois))
+    : (await db.prepare('SELECT * FROM pointages').all());
   const av = mois
-    ? db.prepare("SELECT * FROM caisse WHERE type = 'Avance' AND substr(date,1,7) = ?").all(mois)
-    : db.prepare("SELECT * FROM caisse WHERE type = 'Avance'").all();
+    ? (await db.prepare("SELECT * FROM caisse WHERE type = 'Avance' AND substr(date,1,7) = ?").all(mois))
+    : (await db.prepare("SELECT * FROM caisse WHERE type = 'Avance'").all());
 
   return users.map((u) => {
     let jours = 0, heuresSup = 0, deplacements = 0, brut = 0, nb = 0;
@@ -556,21 +561,21 @@ function salairesPointage(mois) {
 /* ---------------- NUMÉROTATION (séquences sans doublon) ---------------- */
 /* Compteur par préfixe + année : D-2026-001, F-2026-014, CTR-2026-003…
    Évite les doublons produits par un COUNT(*) après suppression d'un document. */
-function nextDocNumber(prefix, table, column = 'num', year) {
+async function nextDocNumber(prefix, table, column = 'num', year) {
   const y = year || new Date().getFullYear();
   const key = `${prefix}-${y}`;
-  let row = db.prepare('SELECT value FROM sequences WHERE key = ?').get(key);
+  let row = (await db.prepare('SELECT value FROM sequences WHERE key = ?').get(key));
   if (!row) {
     let max = 0;
     try {
-      db.prepare(`SELECT ${column} AS v FROM ${table} WHERE ${column} LIKE ?`).all(`${prefix}-${y}-%`)
+      (await db.prepare(`SELECT ${column} AS v FROM ${table} WHERE ${column} LIKE ?`).all(`${prefix}-${y}-%`))
         .forEach((r) => { const m = String(r.v || '').match(/(\d+)\s*$/); if (m) max = Math.max(max, Number(m[1])); });
     } catch { /* table vide ou colonne absente */ }
-    db.prepare('INSERT INTO sequences (key,value) VALUES (?,?)').run(key, max);
+    (await db.prepare('INSERT INTO sequences (key,value) VALUES (?,?)').run(key, max));
     row = { value: max };
   }
   const next = Number(row.value || 0) + 1;
-  db.prepare('UPDATE sequences SET value = ? WHERE key = ?').run(next, key);
+  (await db.prepare('UPDATE sequences SET value = ? WHERE key = ?').run(next, key));
   return `${prefix}-${y}-${String(next).padStart(3, '0')}`;
 }
 
@@ -589,9 +594,9 @@ function verifyPass(pass, stored) {
   } catch { return false; }
 }
 
-function audit(user, action) {
-  db.prepare('INSERT INTO audit (id,user,action,ts) VALUES (?,?,?,?)')
-    .run(uid('a'), user || 'système', action, now());
+async function audit(user, action) {
+  (await db.prepare('INSERT INTO audit (id,user,action,ts) VALUES (?,?,?,?)')
+    .run(uid('a'), user || 'système', action, now()));
 }
 
 const MODULES_LABELS = {
@@ -635,30 +640,28 @@ function canModule(u, mod) {
 }
 
 /* ---------------- SEED ---------------- */
-function seedIfEmpty() {
-  const count = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+async function seedIfEmpty() {
+  const count = (await db.prepare('SELECT COUNT(*) AS n FROM users').get()).n;
   if (count > 0) return;
 
   const insUser = db.prepare('INSERT INTO users (id,name,email,pass,role,phone,active,created) VALUES (?,?,?,?,?,?,?,?)');
-  [
+  for (const [id, name, email, pass, role, phone] of [
     ['u1', 'Sofiane Seghir', 'admin@ass.dz', 'admin123', 'Admin', '+213 550 12 34 56'],
     ['u2', 'Youssef El Amrani', 'youssef@ass.dz', 'tech123', 'Technicien', '+213 661 98 76 54'],
     ['u3', 'Lina Belkacem', 'lina@ass.dz', 'com123', 'Commerciale', '+213 770 07 07 07'],
     ['u4', 'Sami Haddad', 'sami@ass.dz', 'tech123', 'Technicien PV', '+213 555 11 22 33'],
-  ].forEach(([id, name, email, pass, role, phone]) =>
-    insUser.run(id, name, email, hashPass(pass), role, phone, 1, now()));
+  ]) await insUser.run(id, name, email, hashPass(pass), role, phone, 1, now());
 
   const insClient = db.prepare('INSERT INTO clients (id,name,type,status,contact,email,phone,address,wilaya,nif,rc,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)');
-  [
+  for (const [id, name, type, status, contact, email, phone, address, wilaya, nif, rc] of [
     ['c1', 'Hôtel El Aurassi', 'Immeuble', 'client', 'Mme Boudiaf', 'contact@elaurassi.dz', '+213 21 23 45 67', 'Bd Mohamed Khemisti, Alger Centre', 'Alger', '001234567890123', '16/00-1234567 B 12'],
     ['c2', 'Résidence Les Pins', 'Copropriété', 'client', 'Syndic El Djazaïr', 'syndic@lespins.dz', '+213 21 45 67 89', 'Lotissement Les Pins, Hydra', 'Alger', '009876543210987', '16/00-7654321 B 09'],
     ['c3', 'Villa Horizon', 'Villa', 'prospect', 'M. Zerrouki', 'zerrouki@horizon.dz', '+213 550 11 22 33', 'Chemin des Crêtes, Aïn Benian', 'Alger', '', ''],
     ['c4', 'Entrepôt Logistique Ouest', 'Entrepôt', 'client', 'M. Khelifi', 'contact@elog-ouest.dz', '+213 41 33 44 55', 'Zone industrielle Es Sénia', 'Oran', '003456789012345', '31/00-2345678 B 15'],
-  ].forEach(([id, name, type, status, contact, email, phone, address, wilaya, nif, rc]) =>
-    insClient.run(id, name, type, status, contact, email, phone, address, wilaya, nif, rc, now()));
+  ]) await insClient.run(id, name, type, status, contact, email, phone, address, wilaya, nif, rc, now());
 
   const insStock = db.prepare('INSERT INTO stock (id,ref,nom,cat,qty,minQty,loc,prix,fournisseur,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  [
+  for (const [id, ref, nom, cat, qty, minQty, loc, prix, fournisseur] of [
     ['s1', 'CAM-DH-IP-4MP', 'Caméra IP 4MP IR 30m', 'Vidéosurveillance', 12, 5, 'Magasin', 18000, 'Sarl Securelec Alger'],
     ['s2', 'ACC-PAP-2000', "Centrale contrôle d'accès 2 portes", "Contrôle d'accès", 3, 2, 'Magasin', 45000, 'Hikvision Algérie'],
     ['s3', 'INC-DET-OPT', 'Détecteur optique adressable', 'Détection incendie', 45, 10, 'Camion 1', 3800, 'Siemens Feu Algérie'],
@@ -667,61 +670,60 @@ function seedIfEmpty() {
     ['s6', 'RIA-25-30', 'RIA 25/30 - Rouleau 30m + lance', 'Anti-incendie RIA', 8, 3, 'Magasin', 62000, 'Sarl Protection Incendie'],
     ['s7', 'NET-SW-24P', 'Switch PoE 24 ports', 'Réseaux', 6, 2, 'Magasin', 28000, 'TP-Link DZ'],
     ['s8', 'INC-CEN-2B', 'Centrale incendie 2 boucles', 'Détection incendie', 2, 2, 'Magasin', 89000, 'Siemens Feu Algérie'],
-  ].forEach(([id, ref, nom, cat, qty, minQty, loc, prix, fournisseur]) =>
-    insStock.run(id, ref, nom, cat, qty, minQty, loc, prix, fournisseur, now()));
+  ]) await insStock.run(id, ref, nom, cat, qty, minQty, loc, prix, fournisseur, now());
 
   const insDevis = db.prepare('INSERT INTO devis (id,num,clientId,titre,date,validite,status,tva,created) VALUES (?,?,?,?,?,?,?,?,?)');
   const insLigne = db.prepare('INSERT INTO devis_lignes (id,devisId,description,qty,pu) VALUES (?,?,?,?,?)');
-  insDevis.run('d1', 'D-2026-001', 'c1', "Surveillance hôtel - 16 caméras + contrôle d'accès hall", addDays(-3), '30 jours', 'accepté', 19, now());
-  [['Caméra IP 4MP IR x16', 16, 18000], ['NVR 16ch + 2x4To', 1, 89000], ["Centrale contrôle d'accès", 2, 45000], ['Pose + configuration + formation', 1, 240000]]
-    .forEach(([d, q, p]) => insLigne.run(uid('dl'), 'd1', d, q, p));
-  insDevis.run('d2', 'D-2026-002', 'c3', 'Villa caméra + alarme + interphone', addDays(-1), '15 jours', 'envoyé', 19, now());
-  [['Caméra IP x4', 4, 18000], ['Interphone vidéo', 1, 69000]].forEach(([d, q, p]) => insLigne.run(uid('dl'), 'd2', d, q, p));
-  insDevis.run('d3', 'D-2026-003', 'c4', 'Détection incendie entrepôt - 24 détecteurs', addDays(-6), '30 jours', 'accepté', 19, now());
-  [['Détecteur optique adressable', 24, 3800], ['Centrale incendie 2 boucles', 1, 89000], ['Câblage + pose', 1, 310000]]
-    .forEach(([d, q, p]) => insLigne.run(uid('dl'), 'd3', d, q, p));
+  (await insDevis.run('d1', 'D-2026-001', 'c1', "Surveillance hôtel - 16 caméras + contrôle d'accès hall", addDays(-3), '30 jours', 'accepté', 19, now()));
+  for (const [d, q, p] of [['Caméra IP 4MP IR x16', 16, 18000], ['NVR 16ch + 2x4To', 1, 89000], ["Centrale contrôle d'accès", 2, 45000], ['Pose + configuration + formation', 1, 240000]])
+    await insLigne.run(uid('dl'), 'd1', d, q, p);
+  (await insDevis.run('d2', 'D-2026-002', 'c3', 'Villa caméra + alarme + interphone', addDays(-1), '15 jours', 'envoyé', 19, now()));
+  for (const [d, q, p] of [['Caméra IP x4', 4, 18000], ['Interphone vidéo', 1, 69000]]) await insLigne.run(uid('dl'), 'd2', d, q, p);
+  (await insDevis.run('d3', 'D-2026-003', 'c4', 'Détection incendie entrepôt - 24 détecteurs', addDays(-6), '30 jours', 'accepté', 19, now()));
+  for (const [d, q, p] of [['Détecteur optique adressable', 24, 3800], ['Centrale incendie 2 boucles', 1, 89000], ['Câblage + pose', 1, 310000]])
+    await insLigne.run(uid('dl'), 'd3', d, q, p);
 
   const insFact = db.prepare('INSERT INTO factures (id,num,clientId,devisId,date,due,montant,paye,status,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  insFact.run('f1', 'F-2026-001', 'c1', 'd1', now(), addDays(14), 850000, 400000, 'partiel', now());
-  insFact.run('f2', 'F-2026-002', 'c2', null, now(), addDays(30), 220000, 220000, 'payée', now());
-  insFact.run('f3', 'F-2026-003', 'c4', 'd3', now(), addDays(-5), 610000, 0, 'envoyé', now());
+  (await insFact.run('f1', 'F-2026-001', 'c1', 'd1', now(), addDays(14), 850000, 400000, 'partiel', now()));
+  (await insFact.run('f2', 'F-2026-002', 'c2', null, now(), addDays(30), 220000, 220000, 'payée', now()));
+  (await insFact.run('f3', 'F-2026-003', 'c4', 'd3', now(), addDays(-5), 610000, 0, 'envoyé', now()));
 
   const insProj = db.prepare('INSERT INTO projets (id,nom,clientId,devisId,phase,progress,chefId,deadline,description,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  insProj.run('p1', 'Hôtel El Aurassi - Surveillance', 'c1', 'd1', 'Installation', 65, 'u2', addDays(12), '16 caméras + 2 portes accès + NVR', now());
-  insProj.run('p2', 'Entrepôt Ouest - Détection incendie', 'c4', 'd3', 'Étude', 20, 'u2', addDays(40), '24 détecteurs + centrale', now());
+  (await insProj.run('p1', 'Hôtel El Aurassi - Surveillance', 'c1', 'd1', 'Installation', 65, 'u2', addDays(12), '16 caméras + 2 portes accès + NVR', now()));
+  (await insProj.run('p2', 'Entrepôt Ouest - Détection incendie', 'c4', 'd3', 'Étude', 20, 'u2', addDays(40), '24 détecteurs + centrale', now()));
 
   const insInt = db.prepare('INSERT INTO interventions (id,titre,clientId,projetId,techId,date,duree,status,lieu,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  insInt.run('i1', 'Installation caméras aile B', 'c1', 'p1', 'u2', new Date().toISOString().slice(0, 16), 480, 'programmée', 'Hôtel El Aurassi', now());
-  insInt.run('i2', 'Relevé technique entrepôt', 'c4', 'p2', 'u4', addDays(2).slice(0, 16), 240, 'programmée', 'Entrepôt Ouest', now());
+  (await insInt.run('i1', 'Installation caméras aile B', 'c1', 'p1', 'u2', new Date().toISOString().slice(0, 16), 480, 'programmée', 'Hôtel El Aurassi', now()));
+  (await insInt.run('i2', 'Relevé technique entrepôt', 'c4', 'p2', 'u4', addDays(2).slice(0, 16), 240, 'programmée', 'Entrepôt Ouest', now()));
 
   const insMnt = db.prepare('INSERT INTO maintenance (id,eq,lieu,clientId,type,next,status,techId,created) VALUES (?,?,?,?,?,?,?,?,?)');
-  insMnt.run('m1', 'RIA RDC Hôtel', 'Hôtel El Aurassi - RDC', 'c1', 'RIA / Anti-incendie', addDays(8), 'À vérifier', 'u2', now());
-  insMnt.run('m2', 'Détecteurs fumées hall', 'Hôtel El Aurassi - Hall', 'c1', 'Détection incendie', addDays(45), 'OK', 'u2', now());
-  insMnt.run('m3', 'Désenfumage parking', 'Résidence Les Pins - P-1', 'c2', 'Désenfumage', addDays(-3), 'En retard', 'u2', now());
+  (await insMnt.run('m1', 'RIA RDC Hôtel', 'Hôtel El Aurassi - RDC', 'c1', 'RIA / Anti-incendie', addDays(8), 'À vérifier', 'u2', now()));
+  (await insMnt.run('m2', 'Détecteurs fumées hall', 'Hôtel El Aurassi - Hall', 'c1', 'Détection incendie', addDays(45), 'OK', 'u2', now()));
+  (await insMnt.run('m3', 'Désenfumage parking', 'Résidence Les Pins - P-1', 'c2', 'Désenfumage', addDays(-3), 'En retard', 'u2', now()));
 
   const insPtg = db.prepare('INSERT INTO pointages (id,empId,emp,type,ts,gps,lieu) VALUES (?,?,?,?,?,?,?)');
-  insPtg.run('pt1', 'u2', 'Youssef El Amrani', 'ARRIVÉE', now(), '36.7538, 3.0588 (Alger)', 'Hôtel El Aurassi');
+  (await insPtg.run('pt1', 'u2', 'Youssef El Amrani', 'ARRIVÉE', now(), '36.7538, 3.0588 (Alger)', 'Hôtel El Aurassi'));
 
   const insCon = db.prepare('INSERT INTO contrats (id,type,clientId,ref,objet,dateDep,dateFin,montant,statut,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  insCon.run('ct1', 'Contrat de maintenance', 'c1', 'CTR-2026-001', 'Surveillance + Détection incendie Hôtel El Aurassi', now(), addDays(365), 320000, 'signé', now());
-  insCon.run('ct2', 'Convention - Facture fournisseur', 'c2', 'CON-2026-014', 'RIA + Désenfumage Résidence Les Pins', now(), addDays(365), 180000, 'actif', now());
+  (await insCon.run('ct1', 'Contrat de maintenance', 'c1', 'CTR-2026-001', 'Surveillance + Détection incendie Hôtel El Aurassi', now(), addDays(365), 320000, 'signé', now()));
+  (await insCon.run('ct2', 'Convention - Facture fournisseur', 'c2', 'CON-2026-014', 'RIA + Désenfumage Résidence Les Pins', now(), addDays(365), 180000, 'actif', now()));
 
   const insSol = db.prepare('INSERT INTO solaire (id,client,toiture,conso,kwc,production,rentabilite,cout,statut,created) VALUES (?,?,?,?,?,?,?,?,?,?)');
-  insSol.run('so1', 'Villa Horizon - Aïn Benian', 85, 6500, 6, 7800, 6.2, 1450000, 'Étude', now());
-  insSol.run('so2', 'Entrepôt Ouest - Es Sénia', 400, 85000, 50, 62500, 5.8, 6800000, 'Chantier', now());
+  (await insSol.run('so1', 'Villa Horizon - Aïn Benian', 85, 6500, 6, 7800, 6.2, 1450000, 'Étude', now()));
+  (await insSol.run('so2', 'Entrepôt Ouest - Es Sénia', 400, 85000, 50, 62500, 5.8, 6800000, 'Chantier', now()));
 
-  db.prepare('INSERT INTO documents (id,nom,cat,clientId,created) VALUES (?,?,?,?,?)')
-    .run('dc1', 'Plan câblage RDC - Hôtel El Aurassi.pdf', 'Plan / Schéma', 'c1', now());
+  (await db.prepare('INSERT INTO documents (id,nom,cat,clientId,created) VALUES (?,?,?,?,?)')
+    .run('dc1', 'Plan câblage RDC - Hôtel El Aurassi.pdf', 'Plan / Schéma', 'c1', now()));
 
-  audit('système', 'Initialisation de la base de démonstration');
+  (await audit('système', 'Initialisation de la base de démonstration'));
 }
 
 /* ---------------- SEED PARC & CONTRATS (migration douce) ---------------- */
-function seedParc() {
-  const n = db.prepare('SELECT COUNT(*) AS n FROM equipements').get().n;
+async function seedParc() {
+  const n = (await db.prepare('SELECT COUNT(*) AS n FROM equipements').get()).n;
   if (n === 0) {
     const ins = db.prepare('INSERT INTO equipements (id,clientId,site,cat,marque,modele,serial,qty,dateInstall,garantie,nextCtrl,status,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
-    [
+    for (const r of [
       ['eq1', 'c1', 'Hôtel El Aurassi — RDC', 'Vidéosurveillance', 'Hikvision', 'DS-7616NI-K2 (NVR 16ch)', 'HIK-NVR-229104', 1, addDays(-420), addDays(310), addDays(8), 'En service', 'NVR principal — 16 caméras, 2×4 To'],
       ['eq2', 'c1', 'Hôtel El Aurassi — Hall', 'Détection incendie', 'Siemens', 'FC726 — Centrale 2 boucles', 'SIE-FC726-88412', 1, addDays(-680), addDays(-20), addDays(45), 'En service', 'Supervision incendie hall + restaurants'],
       ['eq3', 'c1', 'Hôtel El Aurassi — RDC', 'RIA / Anti-incendie', 'Sarl Protection Incendie', 'RIA 25/30 — 30 m', 'RIA-2024-0451', 4, addDays(-500), addDays(230), addDays(8), 'Maintenance due', 'Vérification annuelle réglementaire'],
@@ -732,39 +734,39 @@ function seedParc() {
       ['eq8', 'c1', 'Hôtel El Aurassi — Locaux techniques', 'Réseaux', 'TP-Link', 'Switch PoE 24 ports', 'TPL-SW24-11840', 1, addDays(-420), addDays(310), addDays(160), 'En service', 'Alimentation caméras + accès'],
       ['eq9', 'c3', 'Villa Horizon — Aïn Benian', 'Vidéosurveillance', 'Hikvision', 'Caméra IP 4MP IR 30m', 'HIK-CAM-77341', 4, addDays(-90), addDays(640), addDays(120), 'En service', 'Périmètre + entrée'],
       ['eq10', 'c2', 'Résidence Les Pins — Parking', 'Vidéosurveillance', 'Dahua', 'Caméra IP 2MP IR', 'DAH-CAM-40812', 2, addDays(-800), addDays(-90), addDays(-15), 'Hors service', 'Alimentation à remplacer — hors garantie'],
-    ].forEach((r) => ins.run(...r, now()));
-    audit('système', 'Initialisation du parc équipements');
+    ]) await ins.run(...r, now());
+    (await audit('système', 'Initialisation du parc équipements'));
   }
 
   // Complète les contrats existants (colonnes ajoutées par migration)
-  db.prepare("UPDATE contrats SET periodicite = COALESCE(NULLIF(periodicite,''), 'mensuel'), prochaineFacture = COALESCE(NULLIF(prochaineFacture,''), ?), sla = COALESCE(NULLIF(sla,''), '24h/7j'), sites = COALESCE(NULLIF(sites,''), 'Hôtel El Aurassi') WHERE ref = 'CTR-2026-001'").run(addDays(-2));
-  db.prepare("UPDATE contrats SET periodicite = COALESCE(NULLIF(periodicite,''), 'annuel'), prochaineFacture = COALESCE(NULLIF(prochaineFacture,''), ?), sla = COALESCE(NULLIF(sla,''), '48h ouvrées'), sites = COALESCE(NULLIF(sites,''), 'Résidence Les Pins') WHERE ref = 'CON-2026-014'").run(addDays(300));
+  (await db.prepare("UPDATE contrats SET periodicite = COALESCE(NULLIF(periodicite,''), 'mensuel'), prochaineFacture = COALESCE(NULLIF(prochaineFacture,''), ?), sla = COALESCE(NULLIF(sla,''), '24h/7j'), sites = COALESCE(NULLIF(sites,''), 'Hôtel El Aurassi') WHERE ref = 'CTR-2026-001'").run(addDays(-2)));
+  (await db.prepare("UPDATE contrats SET periodicite = COALESCE(NULLIF(periodicite,''), 'annuel'), prochaineFacture = COALESCE(NULLIF(prochaineFacture,''), ?), sla = COALESCE(NULLIF(sla,''), '48h ouvrées'), sites = COALESCE(NULLIF(sites,''), 'Résidence Les Pins') WHERE ref = 'CON-2026-014'").run(addDays(300)));
 }
 
 /* ---------------- SEED NOUVEAUX MODULES (migration douce) ---------------- */
-function seedNouveaux() {
+async function seedNouveaux() {
   /* --- Salaires de démonstration (uniquement s'ils sont encore vides) --- */
   const salairesDemo = { u1: 180000, u2: 65000, u3: 58000, u4: 62000 };
-  Object.keys(salairesDemo).forEach((id) => {
-    db.prepare('UPDATE users SET salaire = ? WHERE id = ? AND (salaire IS NULL OR salaire = 0)').run(salairesDemo[id], id);
-  });
+  for (const id of Object.keys(salairesDemo)) {
+    await db.prepare('UPDATE users SET salaire = ? WHERE id = ? AND (salaire IS NULL OR salaire = 0)').run(salairesDemo[id], id);
+  }
 
   /* --- Assurances des employés (avec échéances pour les notifications) --- */
-  if (db.prepare('SELECT COUNT(*) AS n FROM assurances').get().n === 0) {
+  if ((await db.prepare('SELECT COUNT(*) AS n FROM assurances').get()).n === 0) {
     const ins = db.prepare('INSERT INTO assurances (id,empId,type,assureur,numero,prime,dateDebut,dateFin,statut,couverture,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)');
-    [
+    for (const r of [
       ['as1', 'u2', 'Responsabilité civile professionnelle', 'Saham Assurance', 'RC-2026-00451', 4500, addDays(-300).slice(0, 10), addDays(20).slice(0, 10), 'active', 'RC décennale + dommages ouvrage', 'Renouvellement à négocier', now()],
       ['as2', 'u3', 'AMO / Assurance maladie', 'CAAR Assurances', 'AMO-2026-1187', 3200, addDays(-373).slice(0, 10), addDays(-8).slice(0, 10), 'active', 'Couverture soins + hospitalisation', 'Quittance impayée — à régulariser', now()],
       ['as3', 'u4', 'Assurance véhicule', 'Bharat Assurance', 'VEH-2026-7741', 2800, addDays(-165).slice(0, 10), addDays(200).slice(0, 10), 'active', 'Tous risques — utilitaire technique', '', now()],
       ['as4', 'u1', 'Assurance incendie des locaux', 'Saham Assurance', 'INC-2026-0912', 18500, addDays(-200).slice(0, 10), addDays(165).slice(0, 10), 'active', 'Locaux + matériel + stock', 'Local classe 75 — Tizi Ouzou', now()],
-    ].forEach((r) => ins.run(...r));
-    audit('système', 'Initialisation des assurances employés');
+    ]) await ins.run(...r);
+    (await audit('système', 'Initialisation des assurances employés'));
   }
 
   /* --- Dépenses de l'entreprise --- */
-  if (db.prepare('SELECT COUNT(*) AS n FROM depenses').get().n === 0) {
+  if ((await db.prepare('SELECT COUNT(*) AS n FROM depenses').get()).n === 0) {
     const ins = db.prepare('INSERT INTO depenses (id,date,libelle,categorie,montant,modePaiement,ref,notes,created) VALUES (?,?,?,?,?,?,?,?,?)');
-    [
+    for (const r of [
       ['dp1', addDays(-3).slice(0, 10), 'Loyer local commercial — classe 75', 'Loyer', 85000, 'virement', 'LOU-2026-11', 'Échéance mensuelle', now()],
       ['dp2', addDays(-6).slice(0, 10), 'Facture SONELGAZ — atelier + bureau', 'Énergie', 23400, 'chèque', 'EL-88213', '', now()],
       ['dp3', addDays(-9).slice(0, 10), 'Carburant camion technique n°1', 'Carburant', 15800, 'espèces', '', 'Déplacements chantiers', now()],
@@ -772,12 +774,12 @@ function seedNouveaux() {
       ['dp5', addDays(-18).slice(0, 10), 'Internet fibre + lignes téléphoniques', 'Télécom', 12600, 'prélèvement', 'TEL-2026', '', now()],
       ['dp6', addDays(-25).slice(0, 10), 'Entretien véhicule utilitaire', 'Entretien', 34500, 'chèque', '', 'Vidange + pneus', now()],
       ['dp7', addDays(-40).slice(0, 10), 'Loyer local commercial — classe 75', 'Loyer', 85000, 'virement', 'LOU-2026-10', '', now()],
-    ].forEach((r) => ins.run(...r));
-    audit('système', 'Initialisation des dépenses');
+    ]) await ins.run(...r);
+    (await audit('système', 'Initialisation des dépenses'));
   }
 
   /* --- Ventes / achats de produits (stock mis à jour) --- */
-  if (db.prepare('SELECT COUNT(*) AS n FROM mouvements').get().n === 0) {
+  if ((await db.prepare('SELECT COUNT(*) AS n FROM mouvements').get()).n === 0) {
     const ins = db.prepare('INSERT INTO mouvements (id,type,date,clientId,tiers,lignes,totalHT,tva,totalTTC,statut,modePaiement,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
     const lignes = [
       {
@@ -803,19 +805,19 @@ function seedNouveaux() {
         statut: 'confirmé', mode: 'chèque', notes: 'Commande chantier Es Sénia',
       },
     ];
-    lignes.forEach((m) => {
+    for (const m of lignes) {
       const ht = m.l.reduce((s, l) => s + l.qty * l.pu, 0);
       const ttc = ht * 1.19;
-      ins.run(m.id, m.type, m.date, m.clientId || null, m.tiers, JSON.stringify(m.l),
+      await ins.run(m.id, m.type, m.date, m.clientId || null, m.tiers, JSON.stringify(m.l),
         Math.round(ht * 100) / 100, 19, Math.round(ttc * 100) / 100, m.statut, m.mode, m.notes, now());
-      applyStockMvt({ type: m.type, lignes: JSON.stringify(m.l) }, 1);
-    });
-    audit('système', 'Initialisation des ventes / achats de produits');
+      await applyStockMvt({ type: m.type, lignes: JSON.stringify(m.l) }, 1);
+    }
+    (await audit('système', 'Initialisation des ventes / achats de produits'));
   }
 }
 
 /* ---------------- SEED PAIE / CAISSE (migration douce) ---------------- */
-function seedPaie() {
+async function seedPaie() {
   const ym = todayStr().slice(0, 7);
 
   /* Pointages de démonstration du mois en cours (jours, heures sup., déplacements).
@@ -826,39 +828,39 @@ function seedPaie() {
     { empId: 'u4', emp: 'Sami Haddad', gps: '36.7512, 3.0611 (Alger)', lieu: 'Entrepôt Ouest — Es Sénia' },
   ];
   let ajoutes = 0;
-  models.forEach((m) => {
+  for (const m of models) {
     for (let day = 2; day <= 9; day += 2) {
       const date = `${ym}-${String(day).padStart(2, '0')}`;
-      const deja = db.prepare("SELECT COUNT(*) AS n FROM pointages WHERE empId = ? AND type = 'ARRIVÉE' AND substr(COALESCE(date, substr(ts,1,10)),1,10) = ?").get(m.empId, date).n;
+      const deja = (await db.prepare("SELECT COUNT(*) AS n FROM pointages WHERE empId = ? AND type = 'ARRIVÉE' AND substr(COALESCE(date, substr(ts,1,10)),1,10) = ?").get(m.empId, date)).n;
       if (deja) continue;
       const heuresSup = day === 6 ? 2 : (day === 8 ? 1.5 : 0);
       const deplacement = day === 8 ? 1 : 0;
       const horsWilaya = m.empId === 'u4' && day === 8 ? 1 : 0;
       const mission = horsWilaya ? 'M-ESSENIA-0' + day : '';
       const calc = calculerMontantPointage({ type: 'ARRIVÉE', heuresSup, deplacement, horsWilaya, mission });
-      ins.run(uid('pt'), m.empId, m.emp, 'ARRIVÉE', date + 'T08:00:00', m.gps, m.lieu,
-        date, heuresSup, deplacement, calc.total, 'Pointage manuel — paie calculée', horsWilaya, mission);
+      (await ins.run(uid('pt'), m.empId, m.emp, 'ARRIVÉE', date + 'T08:00:00', m.gps, m.lieu,
+        date, heuresSup, deplacement, calc.total, 'Pointage manuel — paie calculée', horsWilaya, mission));
       ajoutes += 1;
     }
-  });
+  }
   /* Illustre le forfait hors wilaya (une seule mission) sur les données de démo existantes */
-  db.prepare("UPDATE pointages SET horsWilaya = 1, mission = ? WHERE empId = 'u4' AND type = 'ARRIVÉE' AND note = 'Pointage manuel — paie calculée' AND substr(COALESCE(date, substr(ts,1,10)),1,10) = ?")
-    .run('M-ESSENIA-08', `${ym}-08`);
-  if (ajoutes) audit('système', `Initialisation des pointages / paie du mois (${ajoutes} jours)`);
+  (await db.prepare("UPDATE pointages SET horsWilaya = 1, mission = ? WHERE empId = 'u4' AND type = 'ARRIVÉE' AND note = 'Pointage manuel — paie calculée' AND substr(COALESCE(date, substr(ts,1,10)),1,10) = ?")
+    .run('M-ESSENIA-08', `${ym}-08`));
+  if (ajoutes) (await audit('système', `Initialisation des pointages / paie du mois (${ajoutes} jours)`));
 
   /* Caisse : capital de départ + quelques avances */
-  if (db.prepare('SELECT COUNT(*) AS n FROM caisse').get().n === 0) {
+  if ((await db.prepare('SELECT COUNT(*) AS n FROM caisse').get()).n === 0) {
     const ins = db.prepare('INSERT INTO caisse (id,date,type,libelle,empId,emp,montant,modePaiement,reference,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
     const d = (n) => `${ym}-${String(n).padStart(2, '0')}`;
-    ins.run(uid('ca'), d(1), 'Entrée', 'Capital de départ — caisse entreprise', null, null, 500000, 'virement', 'CAP-2026-001', 'Solde initial de la caisse', now());
-    ins.run(uid('ca'), d(4), 'Avance', 'Avance salaire — Youssef El Amrani', 'u2', 'Youssef El Amrani', 3500, 'espèces', '', 'Avance sur salaire du mois', now());
-    ins.run(uid('ca'), d(7), 'Avance', 'Avance salaire — Sami Haddad', 'u4', 'Sami Haddad', 2500, 'espèces', '', 'Avance carburant / déplacement', now());
-    ins.run(uid('ca'), d(9), 'Sortie', 'Fournitures de bureau — caisse', null, null, 3250, 'espèces', '', 'Achat consommables', now());
-    audit('système', 'Initialisation de la caisse');
+    (await ins.run(uid('ca'), d(1), 'Entrée', 'Capital de départ — caisse entreprise', null, null, 500000, 'virement', 'CAP-2026-001', 'Solde initial de la caisse', now()));
+    (await ins.run(uid('ca'), d(4), 'Avance', 'Avance salaire — Youssef El Amrani', 'u2', 'Youssef El Amrani', 3500, 'espèces', '', 'Avance sur salaire du mois', now()));
+    (await ins.run(uid('ca'), d(7), 'Avance', 'Avance salaire — Sami Haddad', 'u4', 'Sami Haddad', 2500, 'espèces', '', 'Avance carburant / déplacement', now()));
+    (await ins.run(uid('ca'), d(9), 'Sortie', 'Fournitures de bureau — caisse', null, null, 3250, 'espèces', '', 'Achat consommables', now()));
+    (await audit('système', 'Initialisation de la caisse'));
   }
   /* Ajustement des montants de la démo d'origine (anciennes valeurs) */
-  db.prepare("UPDATE caisse SET montant = 3500 WHERE notes = 'Avance sur salaire du mois' AND montant = 15000").run();
-  db.prepare("UPDATE caisse SET montant = 2500 WHERE notes = 'Avance carburant / déplacement' AND montant = 10000").run();
+  (await db.prepare("UPDATE caisse SET montant = 3500 WHERE notes = 'Avance sur salaire du mois' AND montant = 15000").run());
+  (await db.prepare("UPDATE caisse SET montant = 2500 WHERE notes = 'Avance carburant / déplacement' AND montant = 10000").run());
 }
 
 /* ---------------- COLLECTIONS ---------------- */
@@ -910,17 +912,17 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-function getUser(req) {
+async function getUser(req) {
   const h = req.headers['authorization'] || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : (new URL(req.url, 'http://x').searchParams.get('token') || '');
   if (!token) return null;
-  const s = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  const s = (await db.prepare('SELECT * FROM sessions WHERE token = ?').get(token));
   if (!s) return null;
   if (s.expires && new Date(s.expires) < new Date()) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    (await db.prepare('DELETE FROM sessions WHERE token = ?').run(token));
     return null;
   }
-  const u = db.prepare('SELECT id,name,email,role,phone,active,perms,services,salaire FROM users WHERE id = ?').get(s.userId);
+  const u = (await db.prepare('SELECT id,name,email,role,phone,active,perms,services,salaire FROM users WHERE id = ?').get(s.userId));
   if (!u || !u.active) return null; // compte désactivé → session invalidée
   return u;
 }
@@ -947,8 +949,8 @@ function loginFailed(key) {
 }
 
 /* Nettoyage périodique des sessions expirées */
-function pruneSessions() {
-  try { db.prepare('DELETE FROM sessions WHERE expires IS NOT NULL AND expires < ?').run(now()); } catch {}
+async function pruneSessions() {
+  try { (await db.prepare('DELETE FROM sessions WHERE expires IS NOT NULL AND expires < ?').run(now())); } catch {}
 }
 
 const MIME = {
@@ -979,11 +981,11 @@ function serveStatic(req, res, pathname) {
 }
 
 /* ---------------- DEVIS HELPERS ---------------- */
-function getDevis(id) {
+async function getDevis(id) {
   if (id && typeof id === 'object') id = id.id;
-  const d = db.prepare('SELECT * FROM devis WHERE id = ?').get(id);
+  const d = (await db.prepare('SELECT * FROM devis WHERE id = ?').get(id));
   if (!d) return null;
-  d.lignes = db.prepare('SELECT * FROM devis_lignes WHERE devisId = ?').all(id);
+  d.lignes = (await db.prepare('SELECT * FROM devis_lignes WHERE devisId = ?').all(id));
   return d;
 }
 function devisTotal(d) {
@@ -1004,15 +1006,15 @@ function parseLignesMvt(raw) {
 function isVente(m) { return String((m && m.type) || '').toLowerCase().indexOf('vente') === 0; }
 
 /* Vérifie que le stock couvre une vente (en tenant compte du mouvement remplacé) */
-function checkStockMvt(m, excludeId) {
+async function checkStockMvt(m, excludeId) {
   if (!isVente(m)) return null;
   for (const l of parseLignesMvt(m.lignes)) {
     if (!l.stockId) continue;
-    const s = db.prepare('SELECT qty, nom FROM stock WHERE id = ?').get(l.stockId);
+    const s = (await db.prepare('SELECT qty, nom FROM stock WHERE id = ?').get(l.stockId));
     if (!s) continue;
     let dispo = Number(s.qty || 0);
     if (excludeId) {
-      const old = db.prepare('SELECT type, lignes FROM mouvements WHERE id = ?').get(excludeId);
+      const old = (await db.prepare('SELECT type, lignes FROM mouvements WHERE id = ?').get(excludeId));
       if (old && isVente(old)) {
         const ol = parseLignesMvt(old.lignes).find((x) => x.stockId === l.stockId);
         if (ol) dispo += Number(ol.qty || 0);
@@ -1026,20 +1028,20 @@ function checkStockMvt(m, excludeId) {
 }
 
 /* sign = 1 → applique le mouvement au stock, sign = -1 → annule le mouvement */
-function applyStockMvt(m, sign) {
+async function applyStockMvt(m, sign) {
   const sens = isVente(m) ? -1 : 1;
   for (const l of parseLignesMvt(m.lignes)) {
     if (!l.stockId) continue;
-    const s = db.prepare('SELECT qty FROM stock WHERE id = ?').get(l.stockId);
+    const s = (await db.prepare('SELECT qty FROM stock WHERE id = ?').get(l.stockId));
     if (!s) continue;
     const q = Number(s.qty || 0) + sens * sign * Number(l.qty || 0);
-    db.prepare('UPDATE stock SET qty = ? WHERE id = ?').run(q, l.stockId);
+    (await db.prepare('UPDATE stock SET qty = ? WHERE id = ?').run(q, l.stockId));
   }
 }
 
 /* Facture d'achat (scannée ou saisie) : chaque ligne de produit entre en stock.
    L'article existant est réapprovisionné (réf, puis désignation + pôle), sinon il est créé. */
-function stockFromAchatFacture(facture) {
+async function stockFromAchatFacture(facture) {
   const lignes = parseLignesMvt(facture && facture.lignes);
   if (!lignes.length) return 0;
   const svc = normalizeService(facture.service) || DEFAULT_SERVICE;
@@ -1052,22 +1054,22 @@ function stockFromAchatFacture(facture) {
     const pu = round2(Number(l.prixUnitaireHT != null ? l.prixUnitaireHT : l.pu) || 0);
     const ref = String(l.ref || '').trim();
     let row = null;
-    if (l.stockId) row = db.prepare('SELECT * FROM stock WHERE id = ?').get(l.stockId) || null;
-    if (!row && ref) row = db.prepare("SELECT * FROM stock WHERE lower(COALESCE(ref,'')) = lower(?)").get(ref) || null;
+    if (l.stockId) row = (await db.prepare('SELECT * FROM stock WHERE id = ?').get(l.stockId)) || null;
+    if (!row && ref) row = (await db.prepare("SELECT * FROM stock WHERE lower(COALESCE(ref,'')) = lower(?)").get(ref)) || null;
     if (!row) {
-      row = db.prepare('SELECT * FROM stock WHERE lower(nom) = lower(?) AND COALESCE(service, ?) = ?')
-        .get(nom, DEFAULT_SERVICE, svc) || null;
+      row = (await db.prepare('SELECT * FROM stock WHERE lower(nom) = lower(?) AND COALESCE(service, ?) = ?')
+        .get(nom, DEFAULT_SERVICE, svc)) || null;
     }
     if (row) {
-      db.prepare(`UPDATE stock SET qty = ?,
+      (await db.prepare(`UPDATE stock SET qty = ?,
         prix = CASE WHEN ? > 0 THEN ? ELSE prix END,
         fournisseur = CASE WHEN ? <> '' THEN ? ELSE fournisseur END
         WHERE id = ?`)
-        .run(Number(row.qty || 0) + qty, pu, pu, fournisseur, fournisseur, row.id);
+        .run(Number(row.qty || 0) + qty, pu, pu, fournisseur, fournisseur, row.id));
     } else {
-      db.prepare('INSERT INTO stock (id,ref,nom,cat,qty,minQty,loc,prix,fournisseur,service,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      (await db.prepare('INSERT INTO stock (id,ref,nom,cat,qty,minQty,loc,prix,fournisseur,service,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
         .run(uid('st'), ref || ('ACH-' + String(facture.num || Date.now())), nom,
-          String(l.categorie || l.cat || 'Achat'), qty, 0, '', pu, fournisseur, svc, now());
+          String(l.categorie || l.cat || 'Achat'), qty, 0, '', pu, fournisseur, svc, now()));
     }
     n++;
   }
@@ -1129,14 +1131,14 @@ function montantEnLettres(n) {
 function moneyShort(n) {
   return Number(n || 0).toLocaleString('fr-FR', { maximumFractionDigits: 0 }) + ' DA';
 }
-function buildNotifications(me) {
+async function buildNotifications(me) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const days = (d) => Math.ceil((new Date(d) - today) / 86400000);
   const items = [];
   const add = (o) => { if (o && o.count > 0) items.push(o); };
 
   if (canModule(me, 'factures')) {
-    const factures = filterByService(db.prepare('SELECT * FROM factures').all(), me)
+    const factures = filterByService((await db.prepare('SELECT * FROM factures').all()), me)
       .map((f) => ({ ...f, reste: round2(num(f.montant) - num(f.paye)) }));
     const late = factures.filter((f) => f.reste > 0.5 && f.due && new Date(f.due) < today);
     add({
@@ -1152,7 +1154,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'achats')) {
-    const achats = filterByService(db.prepare('SELECT * FROM factures_achat').all(), me);
+    const achats = filterByService((await db.prepare('SELECT * FROM factures_achat').all()), me);
     const due = achats.filter((a) => String(a.statut || '').toLowerCase() === 'à payer');
     add({
       id: 'achats-a-payer', module: 'achats', severity: 'amber', icon: 'cart',
@@ -1161,7 +1163,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'stock')) {
-    const stock = filterByService(db.prepare('SELECT * FROM stock').all(), me)
+    const stock = filterByService((await db.prepare('SELECT * FROM stock').all()), me)
       .filter((s) => Number(s.qty || 0) <= Number(s.minQty || 0));
     add({
       id: 'stock-critique', module: 'stock', severity: 'red', icon: 'box',
@@ -1170,7 +1172,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'contrats')) {
-    const contrats = filterByService(db.prepare('SELECT * FROM contrats').all(), me)
+    const contrats = filterByService((await db.prepare('SELECT * FROM contrats').all()), me)
       .filter((c) => c.dateFin && days(c.dateFin) <= 60 && String(c.statut || '').toLowerCase() !== 'résiliée');
     add({
       id: 'contrats-renouveler', module: 'contrats', severity: 'amber', icon: 'file',
@@ -1179,7 +1181,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'maintenance')) {
-    const maint = db.prepare('SELECT * FROM maintenance').all().filter((m) => m.next && new Date(m.next) < today);
+    const maint = (await db.prepare('SELECT * FROM maintenance').all()).filter((m) => m.next && new Date(m.next) < today);
     add({
       id: 'maintenance-retard', module: 'maintenance', severity: 'red', icon: 'shield',
       title: 'Contrôles incendie en retard', count: maint.length,
@@ -1187,7 +1189,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'users')) {
-    const ass = db.prepare('SELECT * FROM assurances').all()
+    const ass = (await db.prepare('SELECT * FROM assurances').all())
       .filter((a) => a.dateFin && days(a.dateFin) <= 30 && String(a.statut || '').toLowerCase() !== 'résiliée');
     add({
       id: 'assurances-expirent', module: 'users', severity: 'amber', icon: 'alert',
@@ -1196,7 +1198,7 @@ function buildNotifications(me) {
     });
   }
   if (canModule(me, 'devis')) {
-    const devis = filterByService(db.prepare('SELECT * FROM devis').all(), me)
+    const devis = filterByService((await db.prepare('SELECT * FROM devis').all()), me)
       .filter((d) => String(d.status || '').toLowerCase() === 'envoyé' && d.date && days(d.date) < -15);
     add({
       id: 'devis-sans-reponse', module: 'devis', severity: 'blue', icon: 'file-text',
@@ -1473,15 +1475,15 @@ Ne rien inventer : laisse vide ou 0 si l'information est absente.`;
 }
 
 /* ---------------- IA : INSTANTANÉ DE GESTION POUR L'ANALYSE ---------------- */
-function aiBusinessSnapshot(me) {
+async function aiBusinessSnapshot(me) {
   const ym = new Date().toISOString().slice(0, 7);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const factures = filterByService(db.prepare('SELECT * FROM factures').all(), me);
-  const devis = filterByService(db.prepare('SELECT * FROM devis').all(), me).map(getDevis);
-  const achats = filterByService(db.prepare('SELECT * FROM factures_achat').all(), me);
-  const stock = filterByService(db.prepare('SELECT * FROM stock').all(), me);
-  const contrats = filterByService(db.prepare('SELECT * FROM contrats').all(), me);
-  const clients = db.prepare('SELECT id,name FROM clients').all();
+  const factures = filterByService((await db.prepare('SELECT * FROM factures').all()), me);
+  const devis = await Promise.all(filterByService((await db.prepare('SELECT * FROM devis').all()), me).map(getDevis));
+  const achats = filterByService((await db.prepare('SELECT * FROM factures_achat').all()), me);
+  const stock = filterByService((await db.prepare('SELECT * FROM stock').all()), me);
+  const contrats = filterByService((await db.prepare('SELECT * FROM contrats').all()), me);
+  const clients = (await db.prepare('SELECT id,name FROM clients').all());
   const cName = (id) => (clients.find((c) => c.id === id) || {}).name || '—';
   const caFacture = round2(factures.reduce((s, f) => s + num(f.montant), 0));
   const caEncaisse = round2(factures.reduce((s, f) => s + num(f.paye), 0));
@@ -1494,7 +1496,7 @@ function aiBusinessSnapshot(me) {
   const pipeline = round2(devis.filter((d) => ['brouillon', 'envoyé'].includes(String(d.status || '')))
     .reduce((s, d) => s + devisTotal(d).ttc, 0));
   const stockCrit = stock.filter((s) => Number(s.qty) <= Number(s.minQty));
-  const depenses = db.prepare('SELECT * FROM depenses').all();
+  const depenses = (await db.prepare('SELECT * FROM depenses').all());
   const depMois = depenses.filter((d) => String(d.date || '').slice(0, 7) === ym);
   const depCats = {};
   depMois.forEach((d) => { const c = d.categorie || 'Divers'; depCats[c] = (depCats[c] || 0) + num(d.montant); });
@@ -1504,7 +1506,7 @@ function aiBusinessSnapshot(me) {
     const j = Math.ceil((new Date(c.dateFin) - today) / 86400000);
     return j >= 0 && j <= 60;
   }).length;
-  const maintenance = db.prepare('SELECT * FROM maintenance').all();
+  const maintenance = (await db.prepare('SELECT * FROM maintenance').all());
   const maintRetard = maintenance.filter((m) => m.next && new Date(m.next) < today).length;
   const achatsAPayer = round2(achats.filter((a) => String(a.statut || '').toLowerCase() === 'à payer').reduce((s, a) => s + num(a.totalTTC), 0));
   const achatsTotal = round2(achats.reduce((s, a) => s + num(a.totalTTC), 0));
@@ -1520,13 +1522,13 @@ function aiBusinessSnapshot(me) {
     contrats: { actifs: contratsActifs, aRenouveler60j: contratsRenouveler },
     maintenanceEnRetard: maintRetard,
     topClients,
-    parPole: servicesSynthese(ym, me),
+    parPole: (await servicesSynthese(ym, me)),
     devise: 'DA',
   };
 }
 
 async function aiAnalyseGestion(me) {
-  const snap = aiBusinessSnapshot(me);
+  const snap = (await aiBusinessSnapshot(me));
   const schema = {
     type: 'OBJECT',
     properties: {
@@ -1565,8 +1567,8 @@ function h(s) {
 function moneyFr(n) {
   return Number(n || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
-function factureDocData(f) {
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(f.clientId) || {};
+async function factureDocData(f) {
+  const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(f.clientId)) || {};
   const tva = Number(f.tva || CONFIG.company.vat || 19);
   let lignes = [];
   let remise = 0;
@@ -1581,7 +1583,7 @@ function factureDocData(f) {
     });
   } else if (f.devisId) {
     // 2. Repli : lignes du devis d'origine
-    const d = getDevis(f.devisId);
+    const d = (await getDevis(f.devisId));
     if (d) {
       lignes = (d.lignes || []).map((l) => ({
         designation: l.description, unite: 'U', quantite: Number(l.qty || 0),
@@ -1984,19 +1986,19 @@ async function handle(req, res) {
     const key = clientIp(req) + '|' + String(email || '').toLowerCase();
     const wait = loginBlocked(key);
     if (wait) return send(res, 429, { error: `Trop de tentatives. Réessayez dans ${Math.ceil(wait / 60)} minute(s).` });
-    const u = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(String(email || ''));
+    const u = (await db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(String(email || '')));
     if (!u || !verifyPass(password, u.pass)) {
       loginFailed(key);
-      audit(String(email || 'inconnu'), 'Échec de connexion');
+      (await audit(String(email || 'inconnu'), 'Échec de connexion'));
       return send(res, 401, { error: 'Identifiants incorrects' });
     }
     if (!u.active) return send(res, 403, { error: 'Compte désactivé — contactez un administrateur' });
     loginFails.delete(key);
     const token = crypto.randomBytes(24).toString('hex');
     const expires = new Date(Date.now() + SESSION_DAYS * 86400000).toISOString();
-    db.prepare('INSERT INTO sessions (token,userId,created,expires,agent) VALUES (?,?,?,?,?)')
-      .run(token, u.id, now(), expires, String(req.headers['user-agent'] || '').slice(0, 180));
-    audit(u.name, 'Connexion');
+    (await db.prepare('INSERT INTO sessions (token,userId,created,expires,agent) VALUES (?,?,?,?,?)')
+      .run(token, u.id, now(), expires, String(req.headers['user-agent'] || '').slice(0, 180)));
+    (await audit(u.name, 'Connexion'));
     return send(res, 200, {
       token, expires,
       user: { id: u.id, name: u.name, email: u.email, role: u.role, phone: u.phone, perms: u.perms, services: u.services, salaire: u.salaire, modules: userModules(u) },
@@ -2015,32 +2017,32 @@ async function handle(req, res) {
 
   /* Changement de mot de passe (utilisateur connecté) */
   if (pathname === '/api/auth/password' && method === 'POST') {
-    const mePwd = getUser(req);
+    const mePwd = (await getUser(req));
     if (!mePwd) return send(res, 401, { error: 'Non authentifié' });
     const body = await readBody(req);
     const current = String(body.current || '');
     const next = String(body.next || '');
     if (next.length < 8) return send(res, 400, { error: 'Le nouveau mot de passe doit contenir au moins 8 caractères' });
-    const full = db.prepare('SELECT pass FROM users WHERE id = ?').get(mePwd.id);
+    const full = (await db.prepare('SELECT pass FROM users WHERE id = ?').get(mePwd.id));
     if (!full || !verifyPass(current, full.pass)) return send(res, 400, { error: 'Mot de passe actuel incorrect' });
-    db.prepare('UPDATE users SET pass = ? WHERE id = ?').run(hashPass(next), mePwd.id);
+    (await db.prepare('UPDATE users SET pass = ? WHERE id = ?').run(hashPass(next), mePwd.id));
     // Déconnecte les autres sessions (sécurité)
     const h = req.headers['authorization'] || '';
     const currentToken = h.startsWith('Bearer ') ? h.slice(7) : '';
-    db.prepare('DELETE FROM sessions WHERE userId = ? AND token != ?').run(mePwd.id, currentToken || '');
-    audit(mePwd.name, 'Changement de mot de passe');
+    (await db.prepare('DELETE FROM sessions WHERE userId = ? AND token != ?').run(mePwd.id, currentToken || ''));
+    (await audit(mePwd.name, 'Changement de mot de passe'));
     return send(res, 200, { ok: true });
   }
 
   if (pathname === '/api/auth/logout' && method === 'POST') {
     const h = req.headers['authorization'] || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : '';
-    if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    if (token) (await db.prepare('DELETE FROM sessions WHERE token = ?').run(token));
     return send(res, 200, { ok: true });
   }
 
   /* ---------- PROTECTED ---------- */
-  const me = getUser(req);
+  const me = (await getUser(req));
   if (pathname.startsWith('/api/')) {
     if (!me) return send(res, 401, { error: 'Non authentifié' });
   }
@@ -2049,7 +2051,7 @@ async function handle(req, res) {
 
   /* ---------- NOTIFICATIONS MÉTIER ---------- */
   if (pathname === '/api/notifications' && method === 'GET') {
-    return send(res, 200, buildNotifications(me));
+    return send(res, 200, (await buildNotifications(me)));
   }
 
   /* ---------- PÔLES / SERVICES ---------- */
@@ -2058,7 +2060,7 @@ async function handle(req, res) {
   }
   if (pathname === '/api/services/synthese' && method === 'GET') {
     const mois = String(url.searchParams.get('mois') || '').slice(0, 7) || new Date().toISOString().slice(0, 7);
-    const rows = servicesSynthese(mois, me);
+    const rows = (await servicesSynthese(mois, me));
     const totals = rows.reduce((t, s) => ({
       ventesHT: round2(t.ventesHT + s.ventesHT), achatsHT: round2(t.achatsHT + s.achatsHT),
       marge: round2(t.marge + s.marge), caFacture: round2(t.caFacture + s.caFacture),
@@ -2071,20 +2073,20 @@ async function handle(req, res) {
   /* ---------- DASHBOARD ---------- */
   if (pathname === '/api/dashboard' && method === 'GET') {
     /* Cloisonnement : un compte limité à certains pôles ne voit que leurs données */
-    const factures = filterByService(db.prepare('SELECT * FROM factures').all(), me);
-    const devis = filterByService(db.prepare('SELECT * FROM devis').all(), me).map(getDevis);
-    const maintenance = db.prepare('SELECT * FROM maintenance').all();
-    const stock = filterByService(db.prepare('SELECT * FROM stock').all(), me);
-    const projets = filterByService(db.prepare('SELECT * FROM projets').all(), me);
-    const interventions = db.prepare('SELECT * FROM interventions').all();
-    const pointages = db.prepare('SELECT * FROM pointages').all();
-    const achats = filterByService(db.prepare('SELECT * FROM factures_achat').all(), me);
-    const auditRows = db.prepare('SELECT * FROM audit ORDER BY ts DESC LIMIT 8').all();
-    const depenses = db.prepare('SELECT * FROM depenses').all();
-    const assurances = db.prepare('SELECT * FROM assurances').all();
-    const employes = db.prepare('SELECT * FROM users').all();
-    const mouvements = filterByService(db.prepare('SELECT * FROM mouvements').all(), me);
-    const caisse = db.prepare('SELECT * FROM caisse').all();
+    const factures = filterByService((await db.prepare('SELECT * FROM factures').all()), me);
+    const devis = await Promise.all(filterByService((await db.prepare('SELECT * FROM devis').all()), me).map(getDevis));
+    const maintenance = (await db.prepare('SELECT * FROM maintenance').all());
+    const stock = filterByService((await db.prepare('SELECT * FROM stock').all()), me);
+    const projets = filterByService((await db.prepare('SELECT * FROM projets').all()), me);
+    const interventions = (await db.prepare('SELECT * FROM interventions').all());
+    const pointages = (await db.prepare('SELECT * FROM pointages').all());
+    const achats = filterByService((await db.prepare('SELECT * FROM factures_achat').all()), me);
+    const auditRows = (await db.prepare('SELECT * FROM audit ORDER BY ts DESC LIMIT 8').all());
+    const depenses = (await db.prepare('SELECT * FROM depenses').all());
+    const assurances = (await db.prepare('SELECT * FROM assurances').all());
+    const employes = (await db.prepare('SELECT * FROM users').all());
+    const mouvements = filterByService((await db.prepare('SELECT * FROM mouvements').all()), me);
+    const caisse = (await db.prepare('SELECT * FROM caisse').all());
 
     const today = new Date().toDateString();
     const dLeft = (d) => Math.ceil((new Date(d) - new Date()) / 86400000);
@@ -2092,12 +2094,13 @@ async function handle(req, res) {
     const depMois = depenses.filter((d) => String(d.date || '').slice(0, 7) === ym);
     const mvtMois = mouvements.filter((m) => String(m.date || '').slice(0, 7) === ym);
     const isVenteM = (m) => String(m.type || '').toLowerCase().indexOf('vente') === 0;
+    const userName = (id) => (employes.find((u) => u.id === id) || {}).name || '—';
     const alertesAssurance = assurances
       .filter((a) => a.dateFin && String(a.statut || '').toLowerCase() !== 'résiliée' && dLeft(a.dateFin) <= 30)
       .sort((a, b) => dLeft(a.dateFin) - dLeft(b.dateFin))
       .map((a) => ({
         id: a.id,
-        employe: (db.prepare('SELECT name FROM users WHERE id = ?').get(a.empId) || {}).name || '—',
+        employe: userName(a.empId),
         type: a.type, assureur: a.assureur, dateFin: a.dateFin,
         jours: dLeft(a.dateFin), expire: dLeft(a.dateFin) < 0,
       }));
@@ -2114,7 +2117,7 @@ async function handle(req, res) {
 
     /* La masse salariale est calculée depuis les pointages du mois (jours × 2000
        + heures sup. × 375 + déplacements × 2000 + missions hors wilaya × 1200 − avances de la caisse). */
-    const salaires = okUsers ? salairesPointage(ym).filter((s) => s.active) : [];
+    const salaires = okUsers ? (await salairesPointage(ym)).filter((s) => s.active) : [];
     const masseSalariale = round2(salaires.reduce((s, x) => s + x.net, 0));
     const caisseInfo = soldeCaisse(caisse);
     const avancesMois = round2(caisse.filter((a) => a.type === 'Avance' && String(a.date || '').slice(0, 7) === ym).reduce((s, a) => s + num(a.montant), 0));
@@ -2174,7 +2177,7 @@ async function handle(req, res) {
       factures: okFin ? factures.slice(-5).reverse() : [],
       audit: auditRows,
       counts: {
-        clients: canModule(me, 'clients') ? db.prepare('SELECT COUNT(*) AS n FROM clients').get().n : null,
+        clients: canModule(me, 'clients') ? (await db.prepare('SELECT COUNT(*) AS n FROM clients').get()).n : null,
         projets: canModule(me, 'projets') ? projets.length : null,
         interventions: canModule(me, 'interventions') ? interventions.length : null,
         stock: okStock ? stock.length : null,
@@ -2185,16 +2188,16 @@ async function handle(req, res) {
   /* ---------- RAPPORTS & ANALYSE ---------- */
   if (pathname === '/api/reports' && method === 'GET') {
     /* Les rapports respectent le cloisonnement par pôle du compte */
-    const factures = filterByService(db.prepare('SELECT * FROM factures').all(), me);
-    const devis = filterByService(db.prepare('SELECT * FROM devis').all(), me).map(getDevis);
-    const clients = db.prepare('SELECT * FROM clients').all();
-    const contrats = filterByService(db.prepare('SELECT * FROM contrats').all(), me);
-    const equipements = filterByService(db.prepare('SELECT * FROM equipements').all(), me);
-    const stock = filterByService(db.prepare('SELECT * FROM stock').all(), me);
-    const achats = filterByService(db.prepare('SELECT * FROM factures_achat').all(), me);
-    const mouvements = filterByService(db.prepare('SELECT * FROM mouvements').all(), me);
-    const interventions = db.prepare('SELECT * FROM interventions').all();
-    const maintenance = db.prepare('SELECT * FROM maintenance').all();
+    const factures = filterByService((await db.prepare('SELECT * FROM factures').all()), me);
+    const devis = await Promise.all(filterByService((await db.prepare('SELECT * FROM devis').all()), me).map(getDevis));
+    const clients = (await db.prepare('SELECT * FROM clients').all());
+    const contrats = filterByService((await db.prepare('SELECT * FROM contrats').all()), me);
+    const equipements = filterByService((await db.prepare('SELECT * FROM equipements').all()), me);
+    const stock = filterByService((await db.prepare('SELECT * FROM stock').all()), me);
+    const achats = filterByService((await db.prepare('SELECT * FROM factures_achat').all()), me);
+    const mouvements = filterByService((await db.prepare('SELECT * FROM mouvements').all()), me);
+    const interventions = (await db.prepare('SELECT * FROM interventions').all());
+    const maintenance = (await db.prepare('SELECT * FROM maintenance').all());
 
     const num = (v) => Number(v || 0);
     const clientName = (id) => (clients.find((c) => c.id === id) || {}).name || '—';
@@ -2264,15 +2267,15 @@ async function handle(req, res) {
     const achatsAPayer = achats.filter((a) => String(a.statut || '').toLowerCase() === 'à payer').reduce((s, a) => s + num(a.totalTTC), 0);
 
     // Dépenses de l'entreprise
-    const depenses = db.prepare('SELECT * FROM depenses').all();
+    const depenses = (await db.prepare('SELECT * FROM depenses').all());
     const ymNow = new Date().toISOString().slice(0, 7);
     const depMois = depenses.filter((d) => String(d.date || '').slice(0, 7) === ymNow);
     const depParCat = {};
     depenses.forEach((d) => { const c = d.categorie || 'Autre'; depParCat[c] = (depParCat[c] || 0) + num(d.montant); });
     /* Masse salariale = calcul issue des pointages du mois (plus les avances) */
-    const salaires = salairesPointage(ymNow).filter((s) => s.active);
+    const salaires = (await salairesPointage(ymNow)).filter((s) => s.active);
     const masseSalariale = round2(salaires.reduce((s, x) => s + x.net, 0));
-    const caisseInfo = soldeCaisse(db.prepare('SELECT * FROM caisse').all());
+    const caisseInfo = soldeCaisse((await db.prepare('SELECT * FROM caisse').all()));
 
     // Charge opérationnelle
     const missionsTotal = interventions.length;
@@ -2316,7 +2319,7 @@ async function handle(req, res) {
       missions: { total: missionsTotal, terminees: missionsTerminees, maintenanceEnRetard },
       margeBrute: round2(caFacture - achatsTTC),
       resultatEstime: pl.resultat,
-      parService: servicesSynthese(ymNow, me),
+      parService: (await servicesSynthese(ymNow, me)),
     });
   }
 
@@ -2345,8 +2348,8 @@ async function handle(req, res) {
       d.setDate(d.getDate() + i);
       days.push({ date: ymd(d), label: d.toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: 'short' }), items: [] });
     }
-    const clients = db.prepare('SELECT id,name FROM clients').all();
-    const users = db.prepare('SELECT id,name FROM users').all();
+    const clients = (await db.prepare('SELECT id,name FROM clients').all());
+    const users = (await db.prepare('SELECT id,name FROM users').all());
     const cName = (id) => (clients.find((c) => c.id === id) || {}).name || '';
     const tName = (id) => (users.find((u) => u.id === id) || {}).name || '';
     const push = (dateStr, item) => {
@@ -2356,13 +2359,13 @@ async function handle(req, res) {
       const day = days.find((x) => x.date === ymd(d));
       if (day) day.items.push(item);
     };
-    db.prepare('SELECT * FROM interventions').all().forEach((i) => {
+    (await db.prepare('SELECT * FROM interventions').all()).forEach((i) => {
       push(i.date, { kind: 'mission', id: i.id, title: i.titre, client: cName(i.clientId), tech: tName(i.techId), status: i.status, lieu: i.lieu, duree: i.duree });
     });
-    db.prepare('SELECT * FROM maintenance').all().forEach((m) => {
+    (await db.prepare('SELECT * FROM maintenance').all()).forEach((m) => {
       push(m.next, { kind: 'controle', id: m.id, title: m.eq, client: cName(m.clientId), tech: tName(m.techId), status: m.status, lieu: m.lieu });
     });
-    db.prepare('SELECT * FROM contrats').all().forEach((c) => {
+    (await db.prepare('SELECT * FROM contrats').all()).forEach((c) => {
       push(c.prochaineFacture, { kind: 'facturation', id: c.id, title: 'Facturation ' + (c.ref || ''), client: cName(c.clientId), status: c.statut, montant: c.montant });
     });
     return send(res, 200, { start: ymd(start), days });
@@ -2371,7 +2374,7 @@ async function handle(req, res) {
   /* ---------- FACTURATION RÉCURRENTE D'UN CONTRAT ---------- */
   if (parts[0] === 'api' && parts[1] === 'contrats' && parts[3] === 'facturer' && method === 'POST') {
     if (!canModule(me, 'contrats')) return send(res, 403, { error: 'Accès non autorisé' });
-    const c = db.prepare('SELECT * FROM contrats WHERE id = ?').get(parts[2]);
+    const c = (await db.prepare('SELECT * FROM contrats WHERE id = ?').get(parts[2]));
     if (!c) return send(res, 404, { error: 'Contrat introuvable' });
     const perYear = { mensuel: 12, trimestriel: 4, semestriel: 2, annuel: 1 };
     const period = perYear[String(c.periodicite || 'mensuel').toLowerCase()] || 12;
@@ -2379,27 +2382,27 @@ async function handle(req, res) {
     if (montant <= 0) return send(res, 400, { error: 'Montant du contrat invalide' });
 
     const tva = Number(CONFIG.company.vat || 19);
-    const num = nextDocNumber('F', 'factures');
+    const num = (await nextDocNumber('F', 'factures'));
     const id = uid('fa');
     const today = todayStr();
     const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
     const objet = `${c.type || 'Contrat'} ${c.ref || ''} — ${c.periodicite || 'mensuel'}`.trim();
     const ht = round2(montant / (1 + tva / 100));
     const lignes = [{ designation: objet, unite: 'Forfait', quantite: 1, pu: ht, tva }];
-    db.prepare('INSERT INTO factures (id,num,clientId,devisId,date,due,montant,paye,status,objet,modePaiement,lignes,tva,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(id, num, c.clientId || null, null, today, due, montant, 0, 'envoyée', objet, 'virement', JSON.stringify(lignes), tva, now());
+    (await db.prepare('INSERT INTO factures (id,num,clientId,devisId,date,due,montant,paye,status,objet,modePaiement,lignes,tva,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, num, c.clientId || null, null, today, due, montant, 0, 'envoyée', objet, 'virement', JSON.stringify(lignes), tva, now()));
     const next = addMonths(c.prochaineFacture || new Date(), 12 / period).slice(0, 10);
-    db.prepare('UPDATE contrats SET prochaineFacture = ? WHERE id = ?').run(next, c.id);
-    audit(me.name, `Facturation contrat ${c.ref} — ${num} (${montant} DA)`);
-    return send(res, 201, { facture: db.prepare('SELECT * FROM factures WHERE id = ?').get(id), prochaineFacture: next });
+    (await db.prepare('UPDATE contrats SET prochaineFacture = ? WHERE id = ?').run(next, c.id));
+    (await audit(me.name, `Facturation contrat ${c.ref} — ${num} (${montant} DA)`));
+    return send(res, 201, { facture: (await db.prepare('SELECT * FROM factures WHERE id = ?').get(id)), prochaineFacture: next });
   }
 
   /* ---------- ATTESTATION DE CONFORMITÉ (PARC) ---------- */
   if (parts[0] === 'api' && parts[1] === 'parc' && parts[2] === 'attestation' && parts[3] && method === 'GET') {
     if (!canModule(me, 'parc')) return send(res, 403, { error: 'Accès non autorisé' });
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(parts[3]);
+    const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(parts[3]));
     if (!client) return send(res, 404, { error: 'Client introuvable' });
-    const eqs = db.prepare('SELECT * FROM equipements WHERE clientId = ? ORDER BY cat, site').all(parts[3]);
+    const eqs = (await db.prepare('SELECT * FROM equipements WHERE clientId = ? ORDER BY cat, site').all(parts[3]));
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(renderAttestationHtml(client, eqs));
   }
@@ -2410,13 +2413,13 @@ async function handle(req, res) {
     let rows;
     if (col === 'audit') {
       if (!isAdmin(me)) return send(res, 403, { error: 'Export du journal réservé aux administrateurs' });
-      rows = db.prepare('SELECT * FROM audit ORDER BY ts DESC').all();
+      rows = (await db.prepare('SELECT * FROM audit ORDER BY ts DESC').all());
     } else {
       if (!COLLECTIONS[col]) return send(res, 404, { error: 'Collection inconnue' });
       if (col === 'users' && !isAdmin(me)) return send(res, 403, { error: 'Export réservé aux administrateurs' });
       const mvtAllowed = col === 'mouvements' ? (canModule(me, 'mouvements') || canModule(me, 'achats')) : canModule(me, COL_MODULE[col] || col);
       if (col !== 'users' && !mvtAllowed) return send(res, 403, { error: 'Accès non autorisé' });
-      rows = db.prepare(`SELECT * FROM ${col}`).all();
+      rows = (await db.prepare(`SELECT * FROM ${col}`).all());
       if (SERVICE_COLLECTIONS.includes(col)) rows = filterByService(rows, me);
       if (col === 'mouvements') {
         /* Cloisonnement ventes / achats selon les droits du compte */
@@ -2442,15 +2445,15 @@ async function handle(req, res) {
   /* ---------- CUSTOM ACTIONS ---------- */
   if (parts[0] === 'api' && parts[1] === 'factures' && parts[3] === 'pay' && method === 'POST') {
     if (!canModule(me, 'factures')) return send(res, 403, { error: 'Accès non autorisé' });
-    const f = db.prepare('SELECT * FROM factures WHERE id = ?').get(parts[2]);
+    const f = (await db.prepare('SELECT * FROM factures WHERE id = ?').get(parts[2]));
     if (!f) return send(res, 404, { error: 'Facture introuvable' });
     const { montant } = await readBody(req);
     const newPaye = Number(f.paye || 0) + Number(montant || 0);
     const paye = Math.min(Number(f.montant), newPaye);
     const status = paye >= Number(f.montant) ? 'payée' : 'partiel';
-    db.prepare('UPDATE factures SET paye = ?, status = ? WHERE id = ?').run(paye, status, f.id);
-    audit(me.name, `Encaissement ${f.num} : ${montant} DA`);
-    return send(res, 200, db.prepare('SELECT * FROM factures WHERE id = ?').get(f.id));
+    (await db.prepare('UPDATE factures SET paye = ?, status = ? WHERE id = ?').run(paye, status, f.id));
+    (await audit(me.name, `Encaissement ${f.num} : ${montant} DA`));
+    return send(res, 200, (await db.prepare('SELECT * FROM factures WHERE id = ?').get(f.id)));
   }
 
   /* Pointage MANUEL : une ARRIVÉE = 1 jour payé (2000 DA) + heures sup. (375 DA/h)
@@ -2458,7 +2461,7 @@ async function handle(req, res) {
   if (parts[0] === 'api' && parts[1] === 'pointages' && parts[2] === 'point' && method === 'POST') {
     if (!canModule(me, 'pointage')) return send(res, 403, { error: 'Accès non autorisé' });
     const { empId, type, lieu, gps, date, heuresSup, deplacement, note, horsWilaya, mission } = await readBody(req);
-    const u = db.prepare('SELECT * FROM users WHERE id = ?').get(empId);
+    const u = (await db.prepare('SELECT * FROM users WHERE id = ?').get(empId));
     if (!u) return send(res, 404, { error: 'Employé introuvable' });
     const day = String(date || todayStr()).slice(0, 10);
     const p = {
@@ -2474,9 +2477,9 @@ async function handle(req, res) {
       heuresSup: calc.heuresSup, deplacement: calc.deplacements, montant: calc.total, note: note || '',
       horsWilaya: calc.horsWilaya, mission: String(mission || ''),
     };
-    db.prepare('INSERT INTO pointages (id,empId,emp,type,ts,gps,lieu,date,heuresSup,deplacement,montant,note,horsWilaya,mission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(row.id, row.empId, row.emp, row.type, row.ts, row.gps, row.lieu, row.date, row.heuresSup, row.deplacement, row.montant, row.note, row.horsWilaya, row.mission);
-    audit(me.name, `Pointage manuel ${row.type} — ${row.emp} (${row.montant} DA)`);
+    (await db.prepare('INSERT INTO pointages (id,empId,emp,type,ts,gps,lieu,date,heuresSup,deplacement,montant,note,horsWilaya,mission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.id, row.empId, row.emp, row.type, row.ts, row.gps, row.lieu, row.date, row.heuresSup, row.deplacement, row.montant, row.note, row.horsWilaya, row.mission));
+    (await audit(me.name, `Pointage manuel ${row.type} — ${row.emp} (${row.montant} DA)`));
     return send(res, 201, row);
   }
 
@@ -2484,14 +2487,14 @@ async function handle(req, res) {
   if (parts[0] === 'api' && parts[1] === 'pointages' && parts[2] === 'salaires' && method === 'GET') {
     if (!canModule(me, 'users')) return send(res, 403, { error: 'Accès non autorisé' });
     const mois = String(url.searchParams.get('mois') || '').slice(0, 7);
-    return send(res, 200, { mois: mois || null, taux: PAIE, salaires: salairesPointage(mois) });
+    return send(res, 200, { mois: mois || null, taux: PAIE, salaires: (await salairesPointage(mois)) });
   }
 
   /* Avance sur salaire → écrite dans la caisse (type « Avance ») */
   if (parts[0] === 'api' && parts[1] === 'caisse' && parts[2] === 'avance' && method === 'POST') {
     if (!canModule(me, 'caisse')) return send(res, 403, { error: 'Accès non autorisé' });
     const { empId, montant, date, motif, modePaiement } = await readBody(req);
-    const u = db.prepare('SELECT name FROM users WHERE id = ?').get(empId);
+    const u = (await db.prepare('SELECT name FROM users WHERE id = ?').get(empId));
     if (!u) return send(res, 404, { error: 'Employé introuvable' });
     const m = round2(Number(montant || 0));
     if (m <= 0) return send(res, 400, { error: 'Le montant de l\'avance doit être supérieur à zéro' });
@@ -2500,9 +2503,9 @@ async function handle(req, res) {
       libelle: 'Avance salaire — ' + u.name, empId, emp: u.name, montant: m,
       modePaiement: modePaiement || 'espèces', reference: '', notes: motif || '', created: now(),
     };
-    db.prepare('INSERT INTO caisse (id,date,type,libelle,empId,emp,montant,modePaiement,reference,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-      .run(row.id, row.date, row.type, row.libelle, row.empId, row.emp, row.montant, row.modePaiement, row.reference, row.notes, row.created);
-    audit(me.name, `Avance caisse — ${row.emp} (${m} DA)`);
+    (await db.prepare('INSERT INTO caisse (id,date,type,libelle,empId,emp,montant,modePaiement,reference,notes,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.id, row.date, row.type, row.libelle, row.empId, row.emp, row.montant, row.modePaiement, row.reference, row.notes, row.created));
+    (await audit(me.name, `Avance caisse — ${row.emp} (${m} DA)`));
     return send(res, 201, row);
   }
 
@@ -2527,7 +2530,7 @@ async function handle(req, res) {
     if (!/^image\//.test(mimeType) && mimeType !== 'application/pdf') return send(res, 415, { error: 'Format non pris en charge (image ou PDF)' });
     try {
       const out = await aiExtractDocument(base64, mimeType, body.kind || 'auto');
-      audit(me.name, `IA lecture document (${out.data.documentType || body.kind || 'auto'}${out.data.sens && out.data.sens !== 'autre' ? ' · ' + out.data.sens : ''})`);
+      (await audit(me.name, `IA lecture document (${out.data.documentType || body.kind || 'auto'}${out.data.sens && out.data.sens !== 'autre' ? ' · ' + out.data.sens : ''})`));
       return send(res, 200, { ok: true, data: out.data, model: out.model });
     } catch (err) {
       return send(res, 502, { error: 'IA indisponible : ' + err.message });
@@ -2544,7 +2547,7 @@ async function handle(req, res) {
     if (brief.length > 1200) return send(res, 400, { error: 'Demande trop longue (1200 caractères maximum)' });
     try {
       const out = await aiGenerateLines(brief, Number(body.tva || 19));
-      audit(me.name, 'IA génération de lignes de devis');
+      (await audit(me.name, 'IA génération de lignes de devis'));
       return send(res, 200, { ok: true, lignes: out.lignes, model: out.model });
     } catch (err) {
       return send(res, 502, { error: 'IA indisponible : ' + err.message });
@@ -2564,7 +2567,7 @@ async function handle(req, res) {
     if (!/^image\//.test(mimeType) && mimeType !== 'application/pdf') return send(res, 415, { error: 'Format non pris en charge (image ou PDF)' });
     try {
       const out = await aiExtractDepense(base64, mimeType);
-      audit(me.name, 'IA lecture justificatif de dépense');
+      (await audit(me.name, 'IA lecture justificatif de dépense'));
       return send(res, 200, { ok: true, data: out.data, model: out.model });
     } catch (err) {
       return send(res, 502, { error: 'IA indisponible : ' + err.message });
@@ -2578,7 +2581,7 @@ async function handle(req, res) {
     if (aiWait) return send(res, 429, { error: `Limite d'usage IA atteinte. Réessayez dans ${Math.ceil(aiWait / 60)} minute(s).` });
     try {
       const out = await aiAnalyseGestion(me);
-      audit(me.name, 'IA analyse de gestion');
+      (await audit(me.name, 'IA analyse de gestion'));
       return send(res, 200, { ok: true, data: out.data, model: out.model, mois: out.mois, genere: out.genere });
     } catch (err) {
       return send(res, 502, { error: 'IA indisponible : ' + err.message });
@@ -2588,9 +2591,9 @@ async function handle(req, res) {
   /* ---------- IMPRESSION FACTURE ---------- */
   if (parts[0] === 'api' && parts[1] === 'factures' && parts[3] === 'print' && method === 'GET') {
     if (!canModule(me, 'factures')) return send(res, 403, { error: 'Accès non autorisé' });
-    const f = db.prepare('SELECT * FROM factures WHERE id = ?').get(parts[2]);
+    const f = (await db.prepare('SELECT * FROM factures WHERE id = ?').get(parts[2]));
     if (!f) return send(res, 404, { error: 'Facture introuvable' });
-    const data = factureDocData(f);
+    const data = (await factureDocData(f));
     const html = renderInvoiceHtml({
       docType: 'FACTURE', numero: f.num, date: f.date, client: data.client,
       lignes: data.lignes, ht: data.ht, tvaMontant: data.tvaMontant, ttc: data.ttc, remise: data.remise,
@@ -2604,10 +2607,10 @@ async function handle(req, res) {
   /* ---------- IMPRESSION DEVIS ---------- */
   if (parts[0] === 'api' && parts[1] === 'devis' && parts[3] === 'print' && method === 'GET') {
     if (!canModule(me, 'devis')) return send(res, 403, { error: 'Accès non autorisé' });
-    const d = getDevis(parts[2]);
+    const d = (await getDevis(parts[2]));
     if (!d) return send(res, 404, { error: 'Devis introuvable' });
     const tot = devisTotal(d);
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId) || {};
+    const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId)) || {};
     const lignes = (d.lignes || []).map((l) => ({
       designation: l.description, unite: 'U', quantite: Number(l.qty || 0),
       pu: Number(l.pu || 0), montant: Number(l.qty || 0) * Number(l.pu || 0), tva: Number(d.tva || 19),
@@ -2624,10 +2627,10 @@ async function handle(req, res) {
   /* ---------- IMPRESSION BON DE COMMANDE (depuis un devis) ---------- */
   if (parts[0] === 'api' && parts[1] === 'devis' && parts[3] === 'bon-commande' && method === 'GET') {
     if (!canModule(me, 'devis')) return send(res, 403, { error: 'Accès non autorisé' });
-    const d = getDevis(parts[2]);
+    const d = (await getDevis(parts[2]));
     if (!d) return send(res, 404, { error: 'Devis introuvable' });
     const tot = devisTotal(d);
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId) || {};
+    const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId)) || {};
     const lignes = (d.lignes || []).map((l) => ({
       designation: l.description, unite: 'U', quantite: Number(l.qty || 0),
       pu: Number(l.pu || 0), montant: Number(l.qty || 0) * Number(l.pu || 0), tva: Number(d.tva || 19),
@@ -2645,10 +2648,10 @@ async function handle(req, res) {
   /* ---------- DEVIS → FACTURE ---------- */
   if (parts[0] === 'api' && parts[1] === 'devis' && parts[3] === 'facture' && method === 'POST') {
     if (!canModule(me, 'factures')) return send(res, 403, { error: 'Accès non autorisé' });
-    const d = getDevis(parts[2]);
+    const d = (await getDevis(parts[2]));
     if (!d) return send(res, 404, { error: 'Devis introuvable' });
     const tot = devisTotal(d);
-    const num = nextDocNumber('F', 'factures');
+    const num = (await nextDocNumber('F', 'factures'));
     const id = uid('fa');
     const today = todayStr();
     const due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
@@ -2656,11 +2659,11 @@ async function handle(req, res) {
     const lignes = (d.lignes || []).map((l) => ({
       designation: l.description || '', unite: 'U', quantite: Number(l.qty || 0), pu: Number(l.pu || 0), tva: Number(d.tva || 19),
     }));
-    db.prepare('INSERT INTO factures (id,num,clientId,devisId,service,date,due,montant,paye,status,objet,modePaiement,lignes,tva,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(id, num, d.clientId, d.id, serviceOf(d), today, due, tot.ttc, 0, 'envoyée', d.titre || '', 'virement', JSON.stringify(lignes), Number(d.tva || 19), now());
-    db.prepare("UPDATE devis SET status = 'accepté' WHERE id = ?").run(d.id);
-    audit(me.name, `Facture ${num} générée depuis ${d.num}`);
-    return send(res, 201, db.prepare('SELECT * FROM factures WHERE id = ?').get(id));
+    (await db.prepare('INSERT INTO factures (id,num,clientId,devisId,service,date,due,montant,paye,status,objet,modePaiement,lignes,tva,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, num, d.clientId, d.id, serviceOf(d), today, due, tot.ttc, 0, 'envoyée', d.titre || '', 'virement', JSON.stringify(lignes), Number(d.tva || 19), now()));
+    (await db.prepare("UPDATE devis SET status = 'accepté' WHERE id = ?").run(d.id));
+    (await audit(me.name, `Facture ${num} générée depuis ${d.num}`));
+    return send(res, 201, (await db.prepare('SELECT * FROM factures WHERE id = ?').get(id)));
   }
 
   /* ---------- JOURNAL D'AUDIT (paginé) ---------- */
@@ -2668,7 +2671,7 @@ async function handle(req, res) {
     const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 100)));
     const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
-    let rows = db.prepare('SELECT * FROM audit ORDER BY ts DESC').all();
+    let rows = (await db.prepare('SELECT * FROM audit ORDER BY ts DESC').all());
     if (!isAdmin(me)) rows = rows.filter((r) => String(r.user || '').toLowerCase() === String(me.name || '').toLowerCase());
     if (q) rows = rows.filter((r) => (String(r.user || '') + ' ' + String(r.action || '')).toLowerCase().indexOf(q) !== -1);
     return send(res, 200, { total: rows.length, offset, limit, rows: rows.slice(offset, offset + limit) });
@@ -2679,7 +2682,9 @@ async function handle(req, res) {
     if (!isAdmin(me)) return send(res, 403, { error: 'Réservé aux administrateurs' });
     let dbSize = 0;
     try { dbSize = fs.statSync(path.join(DATA_DIR, 'ass.db')).size; } catch {}
-    const count = (t) => { try { return db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n; } catch { return 0; } };
+    const count = async (t) => { try { return (await db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get()).n; } catch { return 0; } };
+    const [sessions, clients, devis, factures, achats, contrats, equipements, stock, users, auditCount] =
+      await Promise.all(['sessions', 'clients', 'devis', 'factures', 'factures_achat', 'contrats', 'equipements', 'stock', 'users', 'audit'].map(count));
     return send(res, 200, {
       company: CONFIG.company,
       ai: { configured: !!CONFIG.googleApiKey, model: CONFIG.geminiModel },
@@ -2688,20 +2693,16 @@ async function handle(req, res) {
       node: process.version,
       uptime: Math.round(process.uptime()),
       dbSize,
-      sessions: count('sessions'),
-      counts: {
-        clients: count('clients'), devis: count('devis'), factures: count('factures'),
-        achats: count('factures_achat'), contrats: count('contrats'), equipements: count('equipements'),
-        stock: count('stock'), users: count('users'), audit: count('audit'),
-      },
+      sessions,
+      counts: { clients, devis, factures, achats, contrats, equipements, stock, users, audit: auditCount },
     });
   }
 
   /* ---------- DOSSIER DE TRANSMISSION (admin) ---------- */
   if (pathname === '/api/export/dossier' && method === 'GET') {
     if (!isAdmin(me)) return send(res, 403, { error: 'Dossier réservé aux administrateurs' });
-    const html = renderDossierHtml(req, me);
-    audit(me.name, 'Dossier entreprise généré');
+    const html = (await renderDossierHtml(req, me));
+    (await audit(me.name, 'Dossier entreprise généré'));
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Disposition': `attachment; filename="dossier-entreprise-${todayStr()}.html"`,
@@ -2713,11 +2714,12 @@ async function handle(req, res) {
   /* ---------- SAUVEGARDE DE LA BASE (admin) ---------- */
   if (pathname === '/api/backup' && method === 'GET') {
     if (!isAdmin(me)) return send(res, 403, { error: 'Réservé aux administrateurs' });
-    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
+    try { await db.sync(); } catch (e) { console.warn('[DB] sync avant sauvegarde : ' + (e && e.message || e)); }
+    try { (await db.exec('PRAGMA wal_checkpoint(TRUNCATE);')); } catch {}
     const file = path.join(DATA_DIR, 'ass.db');
     const buf = fs.readFileSync(file);
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    audit(me.name, 'Sauvegarde de la base téléchargée');
+    (await audit(me.name, 'Sauvegarde de la base téléchargée'));
     res.writeHead(200, {
       'Content-Type': 'application/octet-stream',
       'Content-Disposition': `attachment; filename="ass-backup-${stamp}.db"`,
@@ -2730,9 +2732,9 @@ async function handle(req, res) {
   /* ---------- RELEVÉ DE COMPTE CLIENT (A4) ---------- */
   if (parts[0] === 'api' && parts[1] === 'clients' && parts[2] && parts[3] === 'releve' && method === 'GET') {
     if (!canModule(me, 'clients')) return send(res, 403, { error: 'Accès non autorisé' });
-    const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(parts[2]);
+    const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(parts[2]));
     if (!client) return send(res, 404, { error: 'Client introuvable' });
-    const factures = db.prepare('SELECT * FROM factures WHERE clientId = ? ORDER BY date').all(parts[2]);
+    const factures = (await db.prepare('SELECT * FROM factures WHERE clientId = ? ORDER BY date').all(parts[2]));
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(renderReleveHtml(client, factures));
   }
@@ -2757,8 +2759,8 @@ async function handle(req, res) {
     // LIST
     if (!id && method === 'GET') {
       const q = (url.searchParams.get('q') || '').trim().toLowerCase();
-      let rows = db.prepare(`SELECT * FROM ${col}`).all();
-      if (col === 'devis') rows = rows.map(getDevis);
+      let rows = (await db.prepare(`SELECT * FROM ${col}`).all());
+      if (col === 'devis') rows = await Promise.all(rows.map(getDevis));
       if (col === 'users') rows = rows.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, phone: u.phone, active: u.active, salaire: u.salaire, perms: u.perms, services: u.services, created: u.created }));
       if (q) {
         rows = rows.filter((r) => Object.values(r).some((v) => String(v == null ? '' : v).toLowerCase().includes(q)));
@@ -2783,10 +2785,10 @@ async function handle(req, res) {
     // READ ONE
     if (id && method === 'GET') {
       if (col === 'devis') {
-        const d = getDevis(id);
+        const d = (await getDevis(id));
         return d ? send(res, 200, d) : send(res, 404, { error: 'Introuvable' });
       }
-      const row = db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id);
+      const row = (await db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id));
       if (!row) return send(res, 404, { error: 'Introuvable' });
       if (col === 'users') delete row.pass;
       if (SERVICE_COLLECTIONS.includes(col) && !canService(me, row.service)) {
@@ -2801,25 +2803,25 @@ async function handle(req, res) {
 
       if (col === 'devis') {
         const did = uid('d');
-        const num = body.num || nextDocNumber('D', 'devis');
+        const num = body.num || (await nextDocNumber('D', 'devis'));
         const svcDevis = normalizeService(body.service) || DEFAULT_SERVICE;
         if (!canService(me, svcDevis)) return send(res, 403, { error: `Accès non autorisé au pôle ${serviceName(svcDevis)}` });
-        db.prepare('INSERT INTO devis (id,num,clientId,titre,date,validite,status,tva,remise,service,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+        (await db.prepare('INSERT INTO devis (id,num,clientId,titre,date,validite,status,tva,remise,service,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
           .run(did, num, body.clientId || null, body.titre || '', String(body.date || todayStr()).slice(0, 10),
             body.validite || '30 jours', body.status || 'brouillon',
             Number(body.tva) > 0 ? Number(body.tva) : Number(CONFIG.company.vat || 19),
-            Math.max(0, Math.min(100, Number(body.remise || 0))), svcDevis, now());
-        (body.lignes || []).forEach((l) => {
-          db.prepare('INSERT INTO devis_lignes (id,devisId,description,qty,pu) VALUES (?,?,?,?,?)')
+            Math.max(0, Math.min(100, Number(body.remise || 0))), svcDevis, now()));
+        for (const l of (body.lignes || [])) {
+          await db.prepare('INSERT INTO devis_lignes (id,devisId,description,qty,pu) VALUES (?,?,?,?,?)')
             .run(uid('dl'), did, l.description || '', Number(l.qty || 0), Number(l.pu || 0));
-        });
-        audit(me.name, `Devis créé ${num}`);
-        return send(res, 201, getDevis(did));
+        }
+        (await audit(me.name, `Devis créé ${num}`));
+        return send(res, 201, (await getDevis(did)));
       }
 
       if (col === 'users') {
         if (!body.email) return send(res, 400, { error: 'Email requis' });
-        const exists = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(body.email);
+        const exists = (await db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(body.email));
         if (exists) return send(res, 409, { error: 'Email déjà utilisé' });
         if (body.perms != null && typeof body.perms !== 'string') body.perms = JSON.stringify(Array.isArray(body.perms) ? body.perms : []);
         if (body.services != null && typeof body.services !== 'string') body.services = JSON.stringify(Array.isArray(body.services) ? body.services : []);
@@ -2827,7 +2829,7 @@ async function handle(req, res) {
       }
 
       if (col === 'factures') {
-        body.num = body.num || nextDocNumber('F', 'factures');
+        body.num = body.num || (await nextDocNumber('F', 'factures'));
         body.date = String(body.date || todayStr()).slice(0, 10);
         if (!body.due) body.due = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
         body.tva = Number(body.tva) > 0 ? Number(body.tva) : Number(CONFIG.company.vat || 19);
@@ -2846,19 +2848,19 @@ async function handle(req, res) {
         body.statut = body.statut || 'confirmé';
         body.lignes = JSON.stringify(body.lignes || []);
         /* Pôle déduit des articles si l'utilisateur ne l'a pas choisi */
-        if (!normalizeService(body.service)) body.service = serviceFromLignes(body.lignes) || DEFAULT_SERVICE;
-        const errStock = checkStockMvt(body, null);
+        if (!normalizeService(body.service)) body.service = (await serviceFromLignes(body.lignes)) || DEFAULT_SERVICE;
+        const errStock = (await checkStockMvt(body, null));
         if (errStock) return send(res, 400, { error: errStock });
       }
       if (col === 'contrats') {
-        body.ref = body.ref || nextDocNumber('CTR', 'contrats', 'ref');
+        body.ref = body.ref || (await nextDocNumber('CTR', 'contrats', 'ref'));
         body.statut = body.statut || 'actif';
         body.periodicite = body.periodicite || 'mensuel';
         body.dateDep = String(body.dateDep || todayStr()).slice(0, 10);
         if (!body.prochaineFacture) body.prochaineFacture = body.dateDep;
       }
       if (col === 'pointages' && body.empId && !body.emp) {
-        const emp = db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId);
+        const emp = (await db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId));
         body.emp = emp ? emp.name : '—';
       }
       if (col === 'pointages') {
@@ -2871,7 +2873,7 @@ async function handle(req, res) {
         body.type = body.type || 'Sortie';
         if (!body.libelle) body.libelle = body.type === 'Avance' ? 'Avance salaire' : body.type;
         if (body.type === 'Avance' && body.empId && !body.emp) {
-          const emp = db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId);
+          const emp = (await db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId));
           body.emp = emp ? emp.name : '—';
         }
       }
@@ -2883,7 +2885,7 @@ async function handle(req, res) {
           return send(res, 403, { error: `Accès non autorisé au pôle ${serviceName(body.service)}` });
         }
         if (col === 'mouvements') {
-          const errSvc = checkMvtService(body);
+          const errSvc = (await checkMvtService(body));
           if (errSvc) return send(res, 400, { error: errSvc });
         }
       }
@@ -2891,8 +2893,8 @@ async function handle(req, res) {
       /* Les produits d'une facture d'achat entrent en stock — une seule fois par facture */
       let achatDejaVu = false;
       if (col === 'factures_achat' && body.num) {
-        achatDejaVu = !!db.prepare("SELECT id FROM factures_achat WHERE num = ? AND lower(COALESCE(fournisseur,'')) = lower(?)")
-          .get(String(body.num), String(body.fournisseur || ''));
+        achatDejaVu = !!(await db.prepare("SELECT id FROM factures_achat WHERE num = ? AND lower(COALESCE(fournisseur,'')) = lower(?)")
+          .get(String(body.num), String(body.fournisseur || '')));
       }
       let stockAchat = 0;
 
@@ -2907,12 +2909,12 @@ async function handle(req, res) {
         return body[f] == null ? '' : body[f];
       }), now()];
       if (col === 'users') vals.splice(vals.length - 1, 0, hashPass(body.pass || 'tech123'));
-      db.prepare(`INSERT INTO ${col} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals);
-      if (col === 'mouvements') applyStockMvt(body, 1);
-      if (col === 'factures_achat' && !achatDejaVu) stockAchat = stockFromAchatFacture(body);
-      audit(me.name, col === 'users' ? `Accès créé — ${body.name || newId} (${body.role || 'sans rôle'})` :
-        `Création ${col}${col === 'mouvements' ? ' — ' + (body.type || '') + ' produits ' + body.totalTTC + ' DA' : ''}`);
-      const row = db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(newId);
+      (await db.prepare(`INSERT INTO ${col} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals));
+      if (col === 'mouvements') (await applyStockMvt(body, 1));
+      if (col === 'factures_achat' && !achatDejaVu) stockAchat = (await stockFromAchatFacture(body));
+      (await audit(me.name, col === 'users' ? `Accès créé — ${body.name || newId} (${body.role || 'sans rôle'})` :
+        `Création ${col}${col === 'mouvements' ? ' — ' + (body.type || '') + ' produits ' + body.totalTTC + ' DA' : ''}`));
+      const row = (await db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(newId));
       if (row && row.pass) delete row.pass;
       if (row && col === 'factures_achat') row.stockMaj = stockAchat;
       return send(res, 201, row);
@@ -2921,7 +2923,7 @@ async function handle(req, res) {
     // UPDATE
     if (id && (method === 'PUT' || method === 'PATCH')) {
       const body = await readBody(req);
-      const existing = db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id);
+      const existing = (await db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id));
       if (!existing) return send(res, 404, { error: 'Introuvable' });
 
       if (col === 'devis') {
@@ -2929,7 +2931,7 @@ async function handle(req, res) {
         if (!canService(me, existing.service) || !canService(me, svcDevis)) {
           return send(res, 403, { error: `Accès non autorisé au pôle ${serviceName(svcDevis)}` });
         }
-        db.prepare('UPDATE devis SET clientId=?, titre=?, date=?, validite=?, status=?, tva=?, remise=?, service=? WHERE id=?')
+        (await db.prepare('UPDATE devis SET clientId=?, titre=?, date=?, validite=?, status=?, tva=?, remise=?, service=? WHERE id=?')
           .run(body.clientId !== undefined ? body.clientId : existing.clientId,
             body.titre !== undefined ? body.titre : existing.titre,
             body.date !== undefined ? body.date : existing.date,
@@ -2937,14 +2939,16 @@ async function handle(req, res) {
             body.status !== undefined ? body.status : existing.status,
             Number(body.tva !== undefined ? body.tva : existing.tva),
             Math.max(0, Math.min(100, Number(body.remise !== undefined ? body.remise : existing.remise || 0))),
-            svcDevis, id);
+            svcDevis, id));
         if (Array.isArray(body.lignes)) {
-          db.prepare('DELETE FROM devis_lignes WHERE devisId = ?').run(id);
-          body.lignes.forEach((l) => db.prepare('INSERT INTO devis_lignes (id,devisId,description,qty,pu) VALUES (?,?,?,?,?)')
-            .run(uid('dl'), id, l.description || '', Number(l.qty || 0), Number(l.pu || 0)));
+          (await db.prepare('DELETE FROM devis_lignes WHERE devisId = ?').run(id));
+          for (const l of body.lignes) {
+            await db.prepare('INSERT INTO devis_lignes (id,devisId,description,qty,pu) VALUES (?,?,?,?,?)')
+              .run(uid('dl'), id, l.description || '', Number(l.qty || 0), Number(l.pu || 0));
+          }
         }
-        audit(me.name, `Devis modifié ${existing.num}`);
-        return send(res, 200, getDevis(id));
+        (await audit(me.name, `Devis modifié ${existing.num}`));
+        return send(res, 200, (await getDevis(id)));
       }
 
       if (col === 'mouvements') {
@@ -2956,7 +2960,7 @@ async function handle(req, res) {
         body.montant = calculerMontantPointage({ ...existing, ...body }).total;
       }
       if (col === 'caisse' && body.type === 'Avance' && body.empId && !body.emp) {
-        const emp = db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId);
+        const emp = (await db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId));
         body.emp = emp ? emp.name : existing.emp || '—';
       }
       if (col === 'factures') {
@@ -2973,7 +2977,7 @@ async function handle(req, res) {
       if (col === 'users') {
         if (body.email !== undefined && String(body.email || '').trim()) {
           const email = String(body.email).trim();
-          const dup = db.prepare('SELECT id FROM users WHERE lower(email) = lower(?) AND id != ?').get(email, id);
+          const dup = (await db.prepare('SELECT id FROM users WHERE lower(email) = lower(?) AND id != ?').get(email, id));
           if (dup) return send(res, 409, { error: 'Email déjà utilisé' });
           body.email = email;
         }
@@ -2985,7 +2989,7 @@ async function handle(req, res) {
         }
         if (body.pass !== undefined && body.pass !== null && body.pass !== '') {
           if (String(body.pass).length < 8) return send(res, 400, { error: 'Mot de passe : 8 caractères minimum' });
-          db.prepare('UPDATE users SET pass = ? WHERE id = ?').run(hashPass(String(body.pass)), id);
+          (await db.prepare('UPDATE users SET pass = ? WHERE id = ?').run(hashPass(String(body.pass)), id));
         } else if (body.pass !== undefined) {
           delete body.pass;
         }
@@ -2993,7 +2997,7 @@ async function handle(req, res) {
           return send(res, 400, { error: 'Impossible de désactiver votre propre compte' });
         }
         if (body.role !== undefined && String(existing.role || '').toLowerCase() === 'admin' && String(body.role).toLowerCase() !== 'admin') {
-          const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE lower(role) = 'admin' AND active = 1").get().n;
+          const admins = (await db.prepare("SELECT COUNT(*) AS n FROM users WHERE lower(role) = 'admin' AND active = 1").get()).n;
           if (admins <= 1) return send(res, 400, { error: 'Impossible de retirer le rôle du dernier administrateur actif' });
         }
       }
@@ -3009,10 +3013,10 @@ async function handle(req, res) {
           }
         }
         if (col === 'mouvements') {
-          const errSvc = checkMvtService({
+          const errSvc = (await checkMvtService({
             service: body.service !== undefined ? body.service : existing.service,
             lignes: body.lignes !== undefined ? body.lignes : existing.lignes,
-          });
+          }));
           if (errSvc) return send(res, 400, { error: errSvc });
         }
       }
@@ -3032,16 +3036,16 @@ async function handle(req, res) {
             type: body.type !== undefined ? body.type : existing.type,
             lignes: body.lignes !== undefined ? body.lignes : existing.lignes,
           };
-          const errStock = checkStockMvt(cand, id);
+          const errStock = (await checkStockMvt(cand, id));
           if (errStock) return send(res, 400, { error: errStock });
-          applyStockMvt(existing, -1);
+          (await applyStockMvt(existing, -1));
         }
         vals.push(id);
-        db.prepare(`UPDATE ${col} SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
-        if (col === 'mouvements') applyStockMvt(db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id), 1);
+        (await db.prepare(`UPDATE ${col} SET ${sets.join(', ')} WHERE id = ?`).run(...vals));
+        if (col === 'mouvements') (await applyStockMvt((await db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id)), 1));
       }
-      audit(me.name, col === 'users' ? `Accès modifié — ${existing.name || id}` : `Modification ${col}`);
-      const row = db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id);
+      (await audit(me.name, col === 'users' ? `Accès modifié — ${existing.name || id}` : `Modification ${col}`));
+      const row = (await db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(id));
       if (row && row.pass) delete row.pass;
       return send(res, 200, row);
     }
@@ -3050,30 +3054,30 @@ async function handle(req, res) {
     if (id && method === 'DELETE') {
       if (col === 'users' && String(id) === String(me.id)) return send(res, 400, { error: 'Impossible de supprimer votre propre compte' });
       if (col === 'users') {
-        const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE lower(role) = 'admin' AND active = 1").get().n;
-        const target = db.prepare('SELECT role, active FROM users WHERE id = ?').get(id);
+        const admins = (await db.prepare("SELECT COUNT(*) AS n FROM users WHERE lower(role) = 'admin' AND active = 1").get()).n;
+        const target = (await db.prepare('SELECT role, active FROM users WHERE id = ?').get(id));
         if (target && String(target.role).toLowerCase() === 'admin' && admins <= 1) {
           return send(res, 400, { error: 'Impossible de supprimer le dernier administrateur actif' });
         }
       }
       if (col === 'clients') {
-        const linked = db.prepare('SELECT (SELECT COUNT(*) FROM factures WHERE clientId = ?) + (SELECT COUNT(*) FROM devis WHERE clientId = ?) + (SELECT COUNT(*) FROM contrats WHERE clientId = ?) AS n').get(id, id, id).n;
+        const linked = (await db.prepare('SELECT (SELECT COUNT(*) FROM factures WHERE clientId = ?) + (SELECT COUNT(*) FROM devis WHERE clientId = ?) + (SELECT COUNT(*) FROM contrats WHERE clientId = ?) AS n').get(id, id, id)).n;
         if (linked > 0) return send(res, 400, { error: `Ce client a ${linked} document(s) lié(s) — supprimez-les ou archivez la fiche` });
       }
-      if (col === 'devis') db.prepare('DELETE FROM devis_lignes WHERE devisId = ?').run(id);
+      if (col === 'devis') (await db.prepare('DELETE FROM devis_lignes WHERE devisId = ?').run(id));
       if (col === 'mouvements') {
-        const old = db.prepare('SELECT * FROM mouvements WHERE id = ?').get(id);
+        const old = (await db.prepare('SELECT * FROM mouvements WHERE id = ?').get(id));
         if (old && !canModule(me, isVente(old) ? 'mouvements' : 'achats')) return send(res, 403, { error: 'Accès non autorisé à ce mouvement' });
-        if (old) applyStockMvt(old, -1);
+        if (old) (await applyStockMvt(old, -1));
       }
       if (SERVICE_COLLECTIONS.includes(col)) {
-        const rowSvc = db.prepare(`SELECT service FROM ${col} WHERE id = ?`).get(id);
+        const rowSvc = (await db.prepare(`SELECT service FROM ${col} WHERE id = ?`).get(id));
         if (rowSvc && !canService(me, rowSvc.service)) {
           return send(res, 403, { error: 'Accès non autorisé à ce pôle' });
         }
       }
-      db.prepare(`DELETE FROM ${col} WHERE id = ?`).run(id);
-      audit(me.name, col === 'users' ? `Accès supprimé — ${id}` : `Suppression ${col}`);
+      (await db.prepare(`DELETE FROM ${col} WHERE id = ?`).run(id));
+      (await audit(me.name, col === 'users' ? `Accès supprimé — ${id}` : `Suppression ${col}`));
       return send(res, 200, { ok: true });
     }
   }
@@ -3082,17 +3086,17 @@ async function handle(req, res) {
 }
 
 /* ---------------- COMPTE ADMINISTRATEUR INITIAL (hébergement sans démo) ---------------- */
-function seedAdminInitial() {
-  if (db.prepare('SELECT COUNT(*) AS n FROM users').get().n > 0) return;
+async function seedAdminInitial() {
+  if ((await db.prepare('SELECT COUNT(*) AS n FROM users').get()).n > 0) return;
   const email = String(process.env.ADMIN_EMAIL || 'admin@ass.dz').toLowerCase();
   const pass = process.env.ADMIN_PASSWORD;
   if (!pass) {
     console.error('[SÉCURITÉ] ADMIN_PASSWORD manquant : aucun compte créé.');
     return;
   }
-  db.prepare('INSERT INTO users (id,name,email,pass,role,phone,active,created) VALUES (?,?,?,?,?,?,?,?)')
-    .run('u1', 'Administrateur', email, hashPass(pass), 'Admin', '', 1, now());
-  audit('système', 'Création du compte administrateur initial');
+  (await db.prepare('INSERT INTO users (id,name,email,pass,role,phone,active,created) VALUES (?,?,?,?,?,?,?,?)')
+    .run('u1', 'Administrateur', email, hashPass(pass), 'Admin', '', 1, now()));
+  (await audit('système', 'Création du compte administrateur initial'));
   console.log('[SÉCURITÉ] Compte administrateur initial créé : ' + email);
 }
 
@@ -3101,35 +3105,53 @@ function seedAdminInitial() {
    reste vide en dehors du compte administrateur et de la société, sauf
    SEED_DEMO=1 demandé explicitement. */
 const SEED_DEMO = process.env.SEED_DEMO != null ? process.env.SEED_DEMO !== '0' : !PUBLIC_HOST;
-if (SEED_DEMO) {
-  seedIfEmpty();
-  seedParc();
-  seedNouveaux();
-  seedPaie();
-} else {
-  seedAdminInitial();
-}
-seedServices();
-backfillServices();
-pruneSessions();
 
-/* ---------------- INITIALISATION HÉBERGEMENT (Vercel) ---------------- */
-/* Sur un hébergement public : pas de compte de démonstration actif et mot de
-   passe administrateur imposé par variable d'environnement. */
-if (SERVERLESS_HOST) {
-  const adminEmail = String(process.env.ADMIN_EMAIL || 'admin@ass.dz').toLowerCase();
-  let admin = db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(adminEmail);
-  if (!admin) admin = db.prepare("SELECT id FROM users WHERE lower(role) = 'admin' ORDER BY created LIMIT 1").get();
-  if (process.env.ADMIN_PASSWORD && admin) {
-    db.prepare('UPDATE users SET pass = ?, active = 1 WHERE id = ?').run(hashPass(process.env.ADMIN_PASSWORD), admin.id);
-    console.log('[SÉCURITÉ] Mot de passe administrateur défini depuis ADMIN_PASSWORD.');
-  } else {
-    db.prepare('UPDATE users SET active = 0').run();
-    console.error('[SÉCURITÉ] ADMIN_PASSWORD manquant : tous les comptes sont désactivés. Définissez ADMIN_EMAIL et ADMIN_PASSWORD dans Vercel.');
+/* Toute l'initialisation de la base est asynchrone (libSQL/Turso) : le serveur
+   démarre tout de suite, mais chaque requête attend que la base soit prête. */
+async function boot() {
+  await initDb();
+  for (const pragma of PRAGMAS) {
+    try { await db.exec(pragma); } catch (e) {
+      console.warn('[DB] ' + pragma + ' ignoré : ' + (e && e.message || e));
+    }
   }
-  db.prepare("UPDATE users SET active = 0 WHERE lower(email) IN ('lina@ass.dz','youssef@ass.dz','sami@ass.dz')").run();
+  await db.exec(SCHEMA);
+  for (const [table, col, type] of MIGRATIONS) await ensureColumn(table, col, type);
+
+  if (SEED_DEMO) {
+    await seedIfEmpty();
+    await seedParc();
+    await seedNouveaux();
+    await seedPaie();
+  } else {
+    await seedAdminInitial();
+  }
+  await seedServices();
+  await backfillServices();
+  await pruneSessions();
+
+  /* ---------------- INITIALISATION HÉBERGEMENT (Vercel) ---------------- */
+  /* Sur un hébergement public : pas de compte de démonstration actif et mot de
+     passe administrateur imposé par variable d'environnement. */
+  if (SERVERLESS_HOST) {
+    const adminEmail = String(process.env.ADMIN_EMAIL || 'admin@ass.dz').toLowerCase();
+    let admin = await db.prepare('SELECT id FROM users WHERE lower(email) = ?').get(adminEmail);
+    if (!admin) admin = await db.prepare("SELECT id FROM users WHERE lower(role) = 'admin' ORDER BY created LIMIT 1").get();
+    if (process.env.ADMIN_PASSWORD && admin) {
+      await db.prepare('UPDATE users SET pass = ?, active = 1 WHERE id = ?').run(hashPass(process.env.ADMIN_PASSWORD), admin.id);
+      console.log('[SÉCURITÉ] Mot de passe administrateur défini depuis ADMIN_PASSWORD.');
+    } else {
+      await db.prepare('UPDATE users SET active = 0').run();
+      console.error('[SÉCURITÉ] ADMIN_PASSWORD manquant : tous les comptes sont désactivés. Définissez ADMIN_EMAIL et ADMIN_PASSWORD dans Vercel.');
+    }
+    await db.prepare("UPDATE users SET active = 0 WHERE lower(email) IN ('lina@ass.dz','youssef@ass.dz','sami@ass.dz')").run();
+  }
 }
-setInterval(pruneSessions, 6 * 3600 * 1000).unref();
+
+const ready = boot();
+ready.catch((err) => console.error('[DB] Initialisation impossible :', err && err.message || err));
+
+setInterval(() => { pruneSessions().catch((e) => console.error('[SESSIONS]', e && e.message || e)); }, 6 * 3600 * 1000).unref();
 
 async function appHandler(req, res) {
   /* En-têtes de sécurité communs (serveur local et Vercel) */
@@ -3139,6 +3161,12 @@ async function appHandler(req, res) {
   res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(self), microphone=()');
   if (String(req.headers['x-forwarded-proto'] || '').split(',')[0] === 'https') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+
+  try {
+    await ready;
+  } catch (err) {
+    return send(res, 503, { error: 'Base de données indisponible — réessayez dans un instant' });
   }
 
   const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);

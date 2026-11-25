@@ -1,4 +1,4 @@
-# Données locales — la base vit sur le disque Render (/var/data)
+# Données locales — en production la base vit sur Turso Cloud (réplica locale éphémère)
 data/
 *.db
 *.db-wal
@@ -8,3 +8,8 @@ node_modules/
 *.log
 .env
 .env.*
+
+# Lanceur local avec la cle Gemini — ne jamais versionner
+config.local.cmd
+demarrer-local.cmd
+work/
