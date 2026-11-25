@@ -24,6 +24,8 @@ CONFIG.company = CONFIG.company || {
 };
 if (process.env.GOOGLE_API_KEY) CONFIG.googleApiKey = process.env.GOOGLE_API_KEY;
 if (process.env.GEMINI_MODEL) CONFIG.geminiModel = process.env.GEMINI_MODEL;
+/* Ancien alias « gemini-flash-latest » : Google le renvoie en 503 → modèle de référence */
+if (!CONFIG.geminiModel || /latest/i.test(String(CONFIG.geminiModel))) CONFIG.geminiModel = 'gemini-3.5-flash';
 if (process.env.DEMO_MODE != null) CONFIG.demoMode = process.env.DEMO_MODE === '1' || process.env.DEMO_MODE === 'true';
 /* Hébergement public (Vercel, Render) : aucun compte ni donnée de démonstration
    par défaut. DEMO_MODE=1 permet de les réactiver explicitement. */
@@ -1035,6 +1037,43 @@ function applyStockMvt(m, sign) {
   }
 }
 
+/* Facture d'achat (scannée ou saisie) : chaque ligne de produit entre en stock.
+   L'article existant est réapprovisionné (réf, puis désignation + pôle), sinon il est créé. */
+function stockFromAchatFacture(facture) {
+  const lignes = parseLignesMvt(facture && facture.lignes);
+  if (!lignes.length) return 0;
+  const svc = normalizeService(facture.service) || DEFAULT_SERVICE;
+  const fournisseur = String(facture.fournisseur || '').trim();
+  let n = 0;
+  for (const l of lignes) {
+    const nom = String(l.designation || l.nom || '').trim();
+    const qty = Number(l.quantite != null ? l.quantite : l.qty) || 0;
+    if (!nom || qty <= 0) continue;
+    const pu = round2(Number(l.prixUnitaireHT != null ? l.prixUnitaireHT : l.pu) || 0);
+    const ref = String(l.ref || '').trim();
+    let row = null;
+    if (l.stockId) row = db.prepare('SELECT * FROM stock WHERE id = ?').get(l.stockId) || null;
+    if (!row && ref) row = db.prepare("SELECT * FROM stock WHERE lower(COALESCE(ref,'')) = lower(?)").get(ref) || null;
+    if (!row) {
+      row = db.prepare('SELECT * FROM stock WHERE lower(nom) = lower(?) AND COALESCE(service, ?) = ?')
+        .get(nom, DEFAULT_SERVICE, svc) || null;
+    }
+    if (row) {
+      db.prepare(`UPDATE stock SET qty = ?,
+        prix = CASE WHEN ? > 0 THEN ? ELSE prix END,
+        fournisseur = CASE WHEN ? <> '' THEN ? ELSE fournisseur END
+        WHERE id = ?`)
+        .run(Number(row.qty || 0) + qty, pu, pu, fournisseur, fournisseur, row.id);
+    } else {
+      db.prepare('INSERT INTO stock (id,ref,nom,cat,qty,minQty,loc,prix,fournisseur,service,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+        .run(uid('st'), ref || ('ACH-' + String(facture.num || Date.now())), nom,
+          String(l.categorie || l.cat || 'Achat'), qty, 0, '', pu, fournisseur, svc, now());
+    }
+    n++;
+  }
+  return n;
+}
+
 /* ---------------- MONTANT EN LETTRES (FR) ---------------- */
 const FR_UNITS = ['zéro', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf', 'dix',
   'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize', 'dix-sept', 'dix-huit', 'dix-neuf'];
@@ -1185,7 +1224,8 @@ function parseJsonLoose(text) {
 }
 
 async function callGemini(parts, opts = {}) {
-  const models = [...new Set([CONFIG.geminiModel, 'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-flash-latest'].filter(Boolean))];
+  /* gemini-3.5-flash en premier (modèle de référence) ; « gemini-flash-latest » écarté : 503 à répétition */
+  const models = [...new Set(['gemini-3.5-flash', CONFIG.geminiModel, 'gemini-3.6-flash'].filter(Boolean))];
   let lastErr = null;
   const errors = [];
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1230,6 +1270,7 @@ async function callGemini(parts, opts = {}) {
     }
   }
   const err = lastErr || new Error('Service IA indisponible');
+  err.message = `IA indisponible (${models[0]}) — ${errors.join(', ')}`;
   err.detail = errors.join(', ');
   throw err;
 }
@@ -2847,6 +2888,14 @@ async function handle(req, res) {
         }
       }
 
+      /* Les produits d'une facture d'achat entrent en stock — une seule fois par facture */
+      let achatDejaVu = false;
+      if (col === 'factures_achat' && body.num) {
+        achatDejaVu = !!db.prepare("SELECT id FROM factures_achat WHERE num = ? AND lower(COALESCE(fournisseur,'')) = lower(?)")
+          .get(String(body.num), String(body.fournisseur || ''));
+      }
+      let stockAchat = 0;
+
       const newId = uid(col.slice(0, 2));
       const cols = ['id', ...fields, 'created'];
       if (col === 'users') cols.splice(cols.length - 1, 0, 'pass'); // le champ pass n'est pas générique
@@ -2860,10 +2909,12 @@ async function handle(req, res) {
       if (col === 'users') vals.splice(vals.length - 1, 0, hashPass(body.pass || 'tech123'));
       db.prepare(`INSERT INTO ${col} (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals);
       if (col === 'mouvements') applyStockMvt(body, 1);
+      if (col === 'factures_achat' && !achatDejaVu) stockAchat = stockFromAchatFacture(body);
       audit(me.name, col === 'users' ? `Accès créé — ${body.name || newId} (${body.role || 'sans rôle'})` :
         `Création ${col}${col === 'mouvements' ? ' — ' + (body.type || '') + ' produits ' + body.totalTTC + ' DA' : ''}`);
       const row = db.prepare(`SELECT * FROM ${col} WHERE id = ?`).get(newId);
       if (row && row.pass) delete row.pass;
+      if (row && col === 'factures_achat') row.stockMaj = stockAchat;
       return send(res, 201, row);
     }
 

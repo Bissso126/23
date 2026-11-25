@@ -815,7 +815,7 @@
     root.innerHTML =
       '<div class="o-auth-left">' +
         '<div>' +
-          '<div class="o-auth-logo"><div class="o-logo-card"><img src="/assets/logo.png" alt="Advanced Security Systems"></div><div><b>Advanced Security Systems</b><small>ERP Professionnel · Algérie</small></div></div>' +
+          '<div class="o-auth-logo"><div class="o-logo-card" role="img" aria-label="Advanced Security Systems"><div class="o-logo-3d"><span class="o-logo-face"><img src="/assets/logo.png" alt=""></span><span class="o-logo-face o-logo-face--back" aria-hidden="true"><img src="/assets/logo.png" alt=""></span></div></div><div><b>Advanced Security Systems</b><small>ERP Professionnel · Algérie</small></div></div>' +
           '<h1>Pilotez toute<br>l\'entreprise.<br><em>Sécurisez chaque site.</em></h1>' +
           '<p>Vidéosurveillance, contrôle d\'accès, détection incendie, RIA / désenfumage, réseaux et photovoltaïque — devis, chantiers, stock, maintenance et pointage dans une seule plateforme. Conçu pour les entreprises algériennes.</p>' +
           '<div class="o-auth-tags">' +
@@ -3472,9 +3472,10 @@
       data.lignes = JSON.stringify(window.__scanAchatLines || []);
       data.statut = data.statut || 'à payer';
       try {
-        await api('/api/factures_achat', { method: 'POST', body: data });
+        var saved = await api('/api/factures_achat', { method: 'POST', body: data });
         closeModal();
-        toast('Facture d\'achat enregistrée', 'ok');
+        var nStock = Number((saved && saved.stockMaj) || 0);
+        toast(nStock ? ('Facture enregistrée · ' + nStock + ' article(s) ajouté(s) au stock') : 'Facture d\'achat enregistrée', 'ok');
         navigate('achats');
       } catch (e) { toast(e.message, 'err'); }
     }, 'Enregistrer la facture');
