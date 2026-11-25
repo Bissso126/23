@@ -145,6 +145,14 @@ CREATE TABLE IF NOT EXISTS sequences (
 CREATE TABLE IF NOT EXISTS services (
   code TEXT PRIMARY KEY, nom TEXT, couleur TEXT, ordre INTEGER, actif INTEGER DEFAULT 1
 );
+/* Index sur les colonnes les plus filtrées / triées. */
+CREATE INDEX IF NOT EXISTS idx_factures_date ON factures(date);
+CREATE INDEX IF NOT EXISTS idx_factures_client ON factures(clientId);
+CREATE INDEX IF NOT EXISTS idx_devis_date ON devis(date);
+CREATE INDEX IF NOT EXISTS idx_mouvements_date ON mouvements(date);
+CREATE INDEX IF NOT EXISTS idx_clients_name ON clients(name);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(userId);
 `;
 
 /* ---------------- MIGRATIONS ---------------- */
@@ -571,11 +579,14 @@ async function nextDocNumber(prefix, table, column = 'num', year) {
       (await db.prepare(`SELECT ${column} AS v FROM ${table} WHERE ${column} LIKE ?`).all(`${prefix}-${y}-%`))
         .forEach((r) => { const m = String(r.v || '').match(/(\d+)\s*$/); if (m) max = Math.max(max, Number(m[1])); });
     } catch { /* table vide ou colonne absente */ }
-    (await db.prepare('INSERT INTO sequences (key,value) VALUES (?,?)').run(key, max));
-    row = { value: max };
+    /* INSERT OR IGNORE : si une autre requête crée la clé en même temps, on
+       reprend la sienne au lieu de repartir de zéro. */
+    (await db.prepare('INSERT OR IGNORE INTO sequences (key,value) VALUES (?,?)').run(key, max));
   }
-  const next = Number(row.value || 0) + 1;
-  (await db.prepare('UPDATE sequences SET value = ? WHERE key = ?').run(next, key));
+  /* Incrément atomique : SELECT puis UPDATE séparés pouvaient produire deux
+     fois le même numéro lors de créations simultanées. */
+  const updated = (await db.prepare('UPDATE sequences SET value = value + 1 WHERE key = ? RETURNING value').get(key));
+  const next = Number(updated ? updated.value : 1);
   return `${prefix}-${y}-${String(next).padStart(3, '0')}`;
 }
 
@@ -1988,6 +1999,16 @@ async function handle(req, res) {
   const method = req.method;
   const parts = pathname.split('/').filter(Boolean); // e.g. ['api','clients','c1']
 
+  /* ---------- HEALTHCHECK (public, léger, sans session) ---------- */
+  if (pathname === '/api/health') {
+    try {
+      await db.prepare('SELECT 1 AS ok').get();
+      return send(res, 200, { ok: true, db: 'ok', model: CONFIG.geminiModel, version: '2.0.0', time: now() });
+    } catch (e) {
+      return send(res, 503, { ok: false, db: String(e && e.message || e) });
+    }
+  }
+
   /* ---------- AUTH ---------- */
   if (pathname === '/api/auth/login' && method === 'POST') {
     const { email, password } = await readBody(req);
@@ -2051,8 +2072,15 @@ async function handle(req, res) {
 
   /* ---------- PROTECTED ---------- */
   const me = (await getUser(req));
+  /* Un token dédié permet les sauvegardes automatisées (cron) sans stocker
+     de session admin dans un dépôt ou un fichier. */
+  const backupSecret = String(process.env.BACKUP_TOKEN || '');
+  const sentBackupToken = String(req.headers['x-backup-token'] || '');
+  const isBackupJob = pathname === '/api/backup' && method === 'GET'
+    && !!backupSecret && sentBackupToken.length === backupSecret.length
+    && crypto.timingSafeEqual(Buffer.from(sentBackupToken), Buffer.from(backupSecret));
   if (pathname.startsWith('/api/')) {
-    if (!me) return send(res, 401, { error: 'Non authentifié' });
+    if (!me && !isBackupJob) return send(res, 401, { error: 'Non authentifié' });
   }
 
   if (pathname === '/api/auth/me') return send(res, 200, { user: { ...me, modules: userModules(me) } });
@@ -2721,13 +2749,13 @@ async function handle(req, res) {
 
   /* ---------- SAUVEGARDE DE LA BASE (admin) ---------- */
   if (pathname === '/api/backup' && method === 'GET') {
-    if (!isAdmin(me)) return send(res, 403, { error: 'Réservé aux administrateurs' });
+    if (!isBackupJob && !isAdmin(me)) return send(res, 403, { error: 'Réservé aux administrateurs' });
     try { await db.sync(); } catch (e) { console.warn('[DB] sync avant sauvegarde : ' + (e && e.message || e)); }
     try { (await db.exec('PRAGMA wal_checkpoint(TRUNCATE);')); } catch {}
     const file = path.join(DATA_DIR, 'ass.db');
     const buf = fs.readFileSync(file);
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    (await audit(me.name, 'Sauvegarde de la base téléchargée'));
+    (await audit(isBackupJob ? 'sauvegarde-automatique' : me.name, 'Sauvegarde de la base téléchargée'));
     res.writeHead(200, {
       'Content-Type': 'application/octet-stream',
       'Content-Disposition': `attachment; filename="ass-backup-${stamp}.db"`,
@@ -3206,6 +3234,10 @@ if (require.main === module) {
     console.log('');
   });
   process.on('SIGINT', () => { try { db.close(); } catch {} process.exit(0); });
+  /* On journalise sans tuer le processus : un incident isolé ne doit pas
+     rendre tout l'ERP indisponible sur le plan gratuit. */
+  process.on('uncaughtException', (err) => console.error('[FATAL] uncaughtException', err));
+  process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection', err));
 }
 
 module.exports = { handler: appHandler, server, db };

@@ -1,0 +1,55 @@
+name: Sauvegarde Turso
+
+on:
+  schedule:
+    # Tous les jours à 03:17 UTC (une sauvegarde conservée sur 90 jours
+    # dans les artifacts, et durablement sur la branche `backups`).
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    name: Export SQLite de la base Turso
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm ci
+
+      - name: Export de la base
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          mkdir -p backups
+          node scripts/backup-export.js "backups/ass-$(date -u +%F).db"
+
+      - name: Archive (rétention 90 jours)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ass-backup-${{ github.run_id }}
+          path: backups/ass-*.db
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publication durable sur la branche backups
+        run: |
+          DAY=$(date -u +%F)
+          FILE="backups/ass-$DAY.db"
+          git config user.name "backup-bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git fetch origin backups || true
+          if git show-ref --verify --quiet refs/remotes/origin/backups; then
+            git checkout -B backups origin/backups
+          else
+            git checkout -B backups
+          fi
+          git add -f "$FILE"
+          git -c commit.gpgsign=false commit -m "Sauvegarde $DAY" || echo "Aucune différence : base inchangée"
+          git push origin backups

@@ -133,8 +133,8 @@ sont désactivés.
   la première requête suivante prend ~30 s (réveil + synchronisation Turso).
   La base Turso, elle, reste disponible en permanence.
 - **Sauvegarde** : **Paramètres → Sauvegarder la base** (le serveur synchronise
-  la réplica puis télécharge un `.db` complet). Restauration :
-  `turso db create <nom> --from-file <sauvegarde.db>`.
+  la réplica puis télécharge un `.db` complet). Une sauvegarde automatique
+  quotidienne est aussi prévue (voir §9). Restauration : voir §9.
 
 ## 6. Vérifications après déploiement
 
@@ -166,3 +166,78 @@ Pour une présentation avec les données d'exemple, définir `SEED_DEMO=1` et
 `admin@ass.dz / admin123`, `youssef@ass.dz / tech123`, `lina@ass.dz / com123`,
 `sami@ass.dz / tech123` redeviennent actifs. À ne jamais laisser sur une instance
 contenant de vraies données.
+
+## 9. Fiabilité, sauvegardes et tests
+
+### Healthcheck
+
+`GET /api/health` (public, aucune session requise) répond :
+
+```json
+{"ok":true,"db":"ok","model":"gemini-3.5-flash","version":"2.0.0","time":"..."}
+```
+
+`503` signifie que la base n'est pas joignable. Brancher un monitor externe
+(UptimeRobot, Better Stack…) sur cette URL permet d'être alerté et de réveiller
+le service Render en cas de mise en veille.
+
+### Tests automatisés
+
+```bash
+npm test
+```
+
+`node --test tests` démarre un vrai serveur sur une base SQLite temporaire :
+healthcheck, login, CRUD client, numérotation atomique de deux devis
+simultanés, sauvegarde (admin **et** token dédié), statut IA. La CI GitHub
+(`.github/workflows/ci.yml`) exécute ces tests à chaque push sur `main`.
+
+### Sauvegarde automatique
+
+`.github/workflows/backup.yml` exporte la base Turso **tous les jours à 03:17 UTC**
+(secret GitHub `TURSO_DATABASE_URL` et `TURSO_AUTH_TOKEN`) :
+
+- artifact GitHub conservé 90 jours ;
+- fichier durable sur la branche `backups` (`backups/ass-AAAA-MM-JJ.db`) ;
+- vérification des comptages table par table avant validation.
+
+Lancement manuel : onglet **Actions → Sauvegarde Turso → Run workflow**.
+
+Sauvegarde locale équivalente :
+
+```bash
+node scripts/backup-export.js backups/ass-2026-11-25.db
+```
+
+### Restauration
+
+Le fichier `.db` exporté est un SQLite standard. Deux options :
+
+1. **Nouvelle base Turso** (la plus simple) :
+   `turso db create ass-erp-restore --from-file backups/ass-2026-11-25.db`
+   puis mettre à jour `TURSO_DATABASE_URL` sur Render.
+2. **Base existante** : point `DATA_DIR` sur le dossier contenant le fichier
+   (renommé `ass.db`) et pousse vers Turso :
+   `DATA_DIR=./backups node scripts/turso-push.js`
+
+⚠️ La restauration **remplace** les données actuelles : à faire sur une base de
+test d'abord.
+
+### Token de sauvegarde (optionnel)
+
+`BACKUP_TOKEN` permet à un cron externe de télécharger `/api/backup` sans
+session admin :
+
+```bash
+curl -H "x-backup-token: $BACKUP_TOKEN" https://<service>.onrender.com/api/backup -o ass.db
+```
+
+Sans ce token, l'endpoint reste réservé aux administrateurs connectés.
+
+### IA : bascule automatique
+
+`gemini-3.5-flash` est essayé en premier. En cas de `503` (forte demande chez
+Google), le serveur essaie successivement `gemini-3.6-flash`,
+`gemini-3.5-flash-lite` et `gemini-3.1-flash-lite`. Le modèle réellement utilisé
+est renvoyé dans le champ `model` de la réponse ; `/api/ai/status` affiche le
+modèle visé.
