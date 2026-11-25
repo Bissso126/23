@@ -1226,8 +1226,16 @@ function parseJsonLoose(text) {
 }
 
 async function callGemini(parts, opts = {}) {
-  /* gemini-3.5-flash en premier (modèle de référence) ; « gemini-flash-latest » écarté : 503 à répétition */
-  const models = [...new Set(['gemini-3.5-flash', CONFIG.geminiModel, 'gemini-3.6-flash'].filter(Boolean))];
+  /* gemini-3.5-flash reste le modèle de référence. En cas de 503 (forte demande
+     chez Google), on bascule sur les variantes « flash-lite » qui restent
+     disponibles, afin que l'IA ne soit pas paralysée. */
+  const models = [...new Set([
+    'gemini-3.5-flash',
+    CONFIG.geminiModel,
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+  ].filter(Boolean))];
   let lastErr = null;
   const errors = [];
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
