@@ -826,7 +826,6 @@
             '<span class="o-auth-tag">TVA 19 % · DA</span>' +
           '</div>' +
         '</div>' +
-        '<p style="font-size:11.5px;color:rgba(255,255,255,.5);margin:0">© ' + new Date().getFullYear() + ' SARL Advanced Security Systems — Tizi Ouzou, Algérie · Node.js + SQLite</p>' +
       '</div>' +
       '<div class="o-auth-right">' +
         '<h2>Connexion</h2>' +
