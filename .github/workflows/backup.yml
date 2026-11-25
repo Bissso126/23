@@ -2,13 +2,14 @@ name: Sauvegarde Turso
 
 on:
   schedule:
-    # Tous les jours à 03:17 UTC (une sauvegarde conservée sur 90 jours
-    # dans les artifacts, et durablement sur la branche `backups`).
+    # Tous les jours à 03:17 UTC. Les fichiers restent dans les artifacts
+    # GitHub (90 jours, accessibles uniquement aux personnes autorisées).
+    # ⚠️ Ne jamais committer de .db dans ce dépôt : il est public.
     - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   export:
@@ -38,18 +39,7 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Publication durable sur la branche backups
-        run: |
-          DAY=$(date -u +%F)
-          FILE="backups/ass-$DAY.db"
-          git config user.name "backup-bot"
-          git config user.email "backup-bot@users.noreply.github.com"
-          git fetch origin backups || true
-          if git show-ref --verify --quiet refs/remotes/origin/backups; then
-            git checkout -B backups origin/backups
-          else
-            git checkout -B backups
-          fi
-          git add -f "$FILE"
-          git -c commit.gpgsign=false commit -m "Sauvegarde $DAY" || echo "Aucune différence : base inchangée"
-          git push origin backups
+      # Aucune publication git : le dépôt est public et une sauvegarde
+      # contiendrait les hash de mots de passe et les jetons de session.
+      # Pour une conservation > 90 jours, déposer l'artifact dans un
+      # stockage privé (S3/R2/GDrive) ou un dépôt privé dédié.

@@ -197,9 +197,13 @@ simultanés, sauvegarde (admin **et** token dédié), statut IA. La CI GitHub
 `.github/workflows/backup.yml` exporte la base Turso **tous les jours à 03:17 UTC**
 (secret GitHub `TURSO_DATABASE_URL` et `TURSO_AUTH_TOKEN`) :
 
-- artifact GitHub conservé 90 jours ;
-- fichier durable sur la branche `backups` (`backups/ass-AAAA-MM-JJ.db`) ;
+- artifact GitHub conservé **90 jours**, accessible uniquement aux personnes
+  autorisées (le dépôt `23` est public : **ne jamais y committer le `.db`**) ;
 - vérification des comptages table par table avant validation.
+
+Pour conserver une sauvegarde plus de 90 jours, télécharger l'artifact et le
+déposer dans un stockage privé (S3, R2, Google Drive) ou un dépôt **privé**
+dédié. Le fichier contient les hash des mots de passe et les jetons de session.
 
 Lancement manuel : onglet **Actions → Sauvegarde Turso → Run workflow**.
 
