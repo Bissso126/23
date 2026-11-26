@@ -149,6 +149,32 @@ test('les 4 documents commerciaux sont imprimables et numérotés une seule fois
   assert.ok(!html(embed).includes('Imprimer / PDF'), 'le mode aperçu masque la barre d’impression');
 });
 
+test('tarif journalier par employé, saisi par l’administrateur', async () => {
+  const updated = await api('/api/users/u1', { method: 'PUT', body: JSON.stringify({ tauxJournalier: 3500 }) });
+  assert.equal(updated.status, 200);
+
+  const avecTaux = await api('/api/pointages/point', {
+    method: 'POST',
+    body: JSON.stringify({ empId: 'u1', type: 'ARRIVÉE', date: '2026-11-26', tauxJournalier: 3500 }),
+  });
+  assert.equal(avecTaux.status, 201);
+  assert.equal(avecTaux.body.montant, 3500);
+
+  const sansSaisie = await api('/api/pointages/point', {
+    method: 'POST',
+    body: JSON.stringify({ empId: 'u1', type: 'ARRIVÉE', date: '2026-11-27' }),
+  });
+  assert.equal(sansSaisie.status, 201);
+  assert.equal(sansSaisie.body.montant, 3500, 'le tarif de l’employé est repris automatiquement');
+
+  const salaires = await api('/api/pointages/salaires?mois=2026-11');
+  assert.equal(salaires.status, 200);
+  const emp = salaires.body.salaires.find((s) => s.empId === 'u1');
+  assert.ok(emp);
+  assert.equal(emp.brutJours, 7000);
+  assert.equal(emp.jours, 2);
+});
+
 test('sauvegarde : réservée à l’admin ou au token dédié', async () => {
   const denied = await fetch(base + '/api/backup');
   assert.equal(denied.status, 401);

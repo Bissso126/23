@@ -623,6 +623,7 @@
         { k: 'date', l: 'Date du jour', t: 'date', req: true },
         { k: 'type', l: 'Type', t: 'select', opts: ['ARRIVÉE', 'PAUSE', 'REPRISE', 'DÉPART'] },
         { k: 'heuresSup', l: 'Heures supplémentaires', t: 'number', placeholder: 'Ex : 2' },
+        { k: 'tauxJournalier', l: 'Chiffre de la journée (DA) — laissez vide pour le tarif de l’employé', t: 'number', placeholder: 'Ex : 2000' },
         { k: 'deplacement', l: 'Déplacement — véhicule (2000 DA)', t: 'select', opts: ['0', '1'] },
         { k: 'mission', l: 'Mission (réf. / objet)' },
         { k: 'horsWilaya', l: 'Hors wilaya (1200 DA / mission)', t: 'select', opts: ['0', '1'] },
@@ -667,13 +668,15 @@
         { k: 'email', l: 'Email', t: 'email', req: true },
         { k: 'active', l: 'Accès à l\'application', t: 'select', opts: [{ v: '1', l: 'Actif' }, { v: '0', l: 'Désactivé' }] },
         { k: 'phone', l: 'Téléphone' },
-        { k: 'salaire', l: 'Salaire de référence (DA) — indicatif, le salaire payé est calculé depuis les pointages', t: 'number', placeholder: 'Ex : 65000' },
+        { k: 'salaire', l: 'Salaire de référence (DA) — indicatif', t: 'number', placeholder: 'Ex : 65000' },
+        { k: 'tauxJournalier', l: 'Chiffre journalier (DA) — utilisé pour le pointage', t: 'number', placeholder: '2000' },
         { k: 'pass', l: 'Mot de passe', t: 'password', createOnly: true },
       ],
       columns: [
         { k: 'name', main: true, sub: 'email' },
         { k: 'role', badge: true },
         { k: 'salaire', l: 'Salaire', money: true },
+        { k: 'tauxJournalier', l: 'Tarif / jour', money: true },
         { k: 'phone' },
         { k: 'active', l: 'Actif', fn: function (r) { return r.active ? '<span class="o-badge green">actif</span>' : '<span class="o-badge red">inactif</span>'; } },
       ],
@@ -811,51 +814,29 @@
   /* ---------------- AUTH ---------------- */
   function renderAuth() {
     var root = document.getElementById('auth-root');
-    var demo = !!(S.publicCfg && S.publicCfg.demoMode);
     root.hidden = false;
     document.getElementById('app').hidden = true;
-    root.className = 'o-auth';
+    root.className = 'o-auth o-auth-only';
     root.innerHTML =
-      '<div class="o-auth-left">' +
-        '<div>' +
-          '<div class="o-auth-logo"><div class="o-logo-card" role="img" aria-label="Advanced Security Systems"><div class="o-logo-3d"><span class="o-logo-face"><img src="/assets/logo.png" alt=""></span><span class="o-logo-face o-logo-face--back" aria-hidden="true"><img src="/assets/logo.png" alt=""></span></div></div><div><b>Advanced Security Systems</b><small>ERP Professionnel · Algérie</small></div></div>' +
-          '<h1>Pilotez toute<br>l\'entreprise.<br><em>Sécurisez chaque site.</em></h1>' +
-          '<p>Vidéosurveillance, contrôle d\'accès, détection incendie, RIA / désenfumage, réseaux et photovoltaïque — devis, chantiers, stock, maintenance et pointage dans une seule plateforme. Conçu pour les entreprises algériennes.</p>' +
-          '<div class="o-auth-tags">' +
-            '<span class="o-auth-tag">12 modules</span>' +
-            '<span class="o-auth-tag">Conformité incendie</span>' +
-            '<span class="o-auth-tag">Pointage manuel + paie</span>' +
-            '<span class="o-auth-tag">IA documents</span>' +
-            '<span class="o-auth-tag">TVA 19 % · DA</span>' +
+      '<div class="o-login-wrap">' +
+        '<div class="o-logo-card o-logo-card--big" role="img" aria-label="Advanced Security Systems">' +
+          '<div class="o-logo-3d">' +
+            '<span class="o-logo-face"><img src="/assets/logo.png" alt=""></span>' +
+            '<span class="o-logo-face o-logo-face--back" aria-hidden="true"><img src="/assets/logo.png" alt=""></span>' +
           '</div>' +
         '</div>' +
-      '</div>' +
-      '<div class="o-auth-right">' +
-        '<h2>Connexion</h2>' +
-        '<p class="sub">Accédez à votre espace de gestion</p>' +
-        '<div class="o-field"><label>Email</label><input class="o-input" id="lg-email" autocomplete="username" placeholder="prenom.nom@societe.dz"></div>' +
-        '<div class="o-field"><label>Mot de passe</label><input class="o-input" id="lg-pass" type="password" autocomplete="current-password" placeholder="••••••••"></div>' +
-        '<div class="o-auth-err" id="lg-err"></div>' +
-        '<button class="o-btn o-btn-primary" style="width:100%;height:36px" id="lg-btn">Se connecter</button>' +
-        (demo ? '<div class="o-demo-grid">' +
-          '<button class="o-demo" data-demo="admin@ass.dz|admin123"><b>Admin</b><small>admin@ass.dz · admin123</small></button>' +
-          '<button class="o-demo" data-demo="youssef@ass.dz|tech123"><b>Technicien</b><small>youssef@ass.dz · tech123</small></button>' +
-          '<button class="o-demo" data-demo="lina@ass.dz|com123"><b>Commerciale</b><small>lina@ass.dz · com123</small></button>' +
-          '<button class="o-demo" data-demo="sami@ass.dz|tech123"><b>Tech PV</b><small>sami@ass.dz · tech123</small></button>' +
-        '</div>' : '<p class="o-help" style="margin-top:16px;text-align:center">Identifiants fournis par votre administrateur.</p>') +
-        '<p style="margin-top:18px;text-align:center;font-size:10.5px;color:#94a3b8">v' + esc((S.publicCfg && S.publicCfg.version) || '2.0.0') + ' · connexion sécurisée</p>' +
+        '<form class="o-login-form" id="lg-form">' +
+          '<input class="o-input" id="lg-email" type="email" inputmode="email" autocomplete="username" placeholder="Email" aria-label="Email">' +
+          '<input class="o-input" id="lg-pass" type="password" autocomplete="current-password" placeholder="Mot de passe" aria-label="Mot de passe">' +
+          '<button class="o-login-submit" id="lg-btn" type="submit" aria-label="Se connecter">' + icon('chevronRight') + '</button>' +
+          '<div class="o-auth-err" id="lg-err"></div>' +
+        '</form>' +
       '</div>';
 
-    document.getElementById('lg-btn').onclick = doLogin;
-    document.getElementById('lg-pass').onkeydown = function (e) { if (e.key === 'Enter') doLogin(); };
-    document.getElementById('lg-email').onkeydown = function (e) { if (e.key === 'Enter') { var p = document.getElementById('lg-pass'); if (p) p.focus(); } };
-    Array.prototype.forEach.call(root.querySelectorAll('[data-demo]'), function (b) {
-      b.onclick = function () {
-        var p = b.getAttribute('data-demo').split('|');
-        document.getElementById('lg-email').value = p[0];
-        document.getElementById('lg-pass').value = p[1];
-      };
-    });
+    document.getElementById('lg-form').onsubmit = function (e) { e.preventDefault(); doLogin(); };
+    document.getElementById('lg-email').onkeydown = function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); var p = document.getElementById('lg-pass'); if (p) p.focus(); }
+    };
   }
 
   async function doLogin() {
@@ -865,7 +846,7 @@
     var btn = document.getElementById('lg-btn');
     err.textContent = '';
     btn.disabled = true;
-    btn.textContent = 'Connexion…';
+    btn.classList.add('busy');
     try {
       var res = await api('/api/auth/login', { method: 'POST', body: { email: email, password: pass } });
       setToken(res.token);
@@ -878,7 +859,7 @@
       err.textContent = e.message;
     } finally {
       btn.disabled = false;
-      btn.textContent = 'Se connecter';
+      btn.classList.remove('busy');
     }
   }
 
@@ -1507,7 +1488,7 @@
           '<button class="o-btn o-btn-primary" data-act="create">' + icon('plus') + ' Nouvel employé</button>' +
         '</div></div>' +
 
-      '<div class="o-alert" style="margin-bottom:12px"><span>🧮</span><div><b>Salaire payé =</b> jours × 2 000 DA + heures supplémentaires × 375 DA + déplacements × 2 000 DA + missions hors wilaya × 1 200 DA <b>− avances de la caisse</b>. ' +
+      '<div class="o-alert" style="margin-bottom:12px"><span>🧮</span><div><b>Salaire payé =</b> jours × <b>chiffre journalier de l’employé</b> (défini dans sa fiche, 2 000 DA par défaut) + heures supplémentaires × 375 DA + déplacements × 2 000 DA + missions hors wilaya × 1 200 DA <b>− avances de la caisse</b>. ' +
       'Source : pointage manuel du mois de <b>' + esc(mois) + '</b>. Le champ « salaire de référence » de la fiche employé est indicatif.</div></div>' +
 
       '<div class="o-kpis o-kpis-4">' +
@@ -3002,8 +2983,8 @@
   }
 
   /* ---------------- POINTAGE MANUEL + PAIE ---------------- */
-  /* Tarifs (identiques au backend) : 2 000 DA / jour, 375 DA / h supplémentaire,
-     2 000 DA / déplacement (véhicule), 1 200 DA forfaitaires / mission hors wilaya.
+  /* Tarifs par défaut : 2 000 DA / jour (modifiable par employé dans sa fiche),
+     375 DA / h supplémentaire, 2 000 DA / déplacement, 1 200 DA / mission hors wilaya.
      Une ARRIVÉE = une journée payée. */
   var TARIFS = { jour: 2000, heureSup: 375, deplacement: 2000, horsWilaya: 1200 };
   function todayKey() {
@@ -3014,7 +2995,8 @@
     if (String(p.type || '').toUpperCase() !== 'ARRIVÉE') return 0;
     var h = Math.max(0, Number(p.heuresSup || 0));
     var dep = Number(p.deplacement) ? 1 : 0;
-    return Math.round((TARIFS.jour + h * TARIFS.heureSup + dep * TARIFS.deplacement) * 100) / 100;
+    var jour = Number(p.tauxJournalier) > 0 ? Number(p.tauxJournalier) : TARIFS.jour;
+    return Math.round((jour + h * TARIFS.heureSup + dep * TARIFS.deplacement) * 100) / 100;
   }
   function missionKey(p) {
     var ref = String(p.mission || '').trim().toLowerCase();
@@ -3064,6 +3046,7 @@
     var salBody = salVis.length ? salVis.map(function (s) {
       return '<tr>' +
         '<td class="cell-main">' + esc(s.emp || '—') + '<div class="cell-sub">' + esc(s.role || '') + '</div></td>' +
+        '<td class="r">' + money(s.tauxJournalier) + '</td>' +
         '<td class="r"><b>' + num(s.jours) + '</b> j</td>' +
         '<td class="r">' + (Number(s.heuresSup) ? num(s.heuresSup) + ' h' : '—') + '</td>' +
         '<td class="r">' + (Number(s.deplacements) ? num(s.deplacements) : '—') + '</td>' +
@@ -3076,7 +3059,7 @@
 
     return '<div class="o-sheet">' +
       '<div class="o-view-head"><div><h2 class="o-view-title">Pointage manuel</h2>' +
-      '<p class="o-view-sub">Saisie manuelle · 2 000 DA/jour · 375 DA/h sup. · 2 000 DA/déplacement · 1 200 DA/mission hors wilaya</p></div>' +
+      '<p class="o-view-sub">Saisie manuelle · tarif journalier par employé (admin) · 375 DA/h sup. · 2 000 DA/déplacement · 1 200 DA/mission hors wilaya</p></div>' +
       '<div class="o-actions">' +
         '<div class="o-field" style="margin-right:6px"><label style="font-size:11px">Mois de paie</label><input class="o-input" type="month" id="ptg-mois" value="' + esc(moisSel) + '" style="width:150px"></div>' +
         '<button class="o-btn o-btn-default" data-act="export-ptg">' + icon('download') + ' CSV</button>' +
@@ -3089,13 +3072,13 @@
         kpi('Salaires nets du mois', money(netMois), moisSel + ' · brut ' + money(salaires ? totBrut : totalMoisCalcule), 'purple') +
         kpi('H. sup. / Déplacements', num(hsMois) + ' h / ' + depMois, moisSel, 'amber') +
       '</div>' +
-      '<div class="o-alert" style="margin-bottom:12px"><span>🧮</span><div><b>Calcul automatique :</b> chaque <b>ARRIVÉE</b> vaut 2 000 DA, chaque heure supplémentaire 375 DA, chaque déplacement 2 000 DA (frais de véhicule), et <b>1 200 DA forfaitaires par mission hors wilaya</b> (une seule fois, même si la mission dure plusieurs jours). ' +
+      '<div class="o-alert" style="margin-bottom:12px"><span>🧮</span><div><b>Calcul automatique :</b> chaque <b>ARRIVÉE</b> est payée au <b>chiffre journalier de l’employé</b> (2 000 DA par défaut, modifiable dans sa fiche ou directement lors du pointage), plus 375 DA par heure supplémentaire et 2 000 DA par déplacement (frais de véhicule). Le <b>1 200 DA forfaitaires par mission hors wilaya</b> est versé une seule fois, même si la mission dure plusieurs jours. ' +
       'Le montant est repris dans la feuille de salaire, avances de la caisse déduites.</div></div>' +
       (canOpen('users') ? '<div class="o-panel" style="margin-bottom:14px"><div class="o-panel-head">Salaires du mois — ' + esc(moisSel) + ' <span class="o-badge purple">' + salVis.length + '</span></div><div class="o-panel-body" style="padding:0">' +
-        '<div class="o-table-scroll"><table class="o-list"><thead><tr><th>Employé</th><th class="r">Jours payés</th><th class="r">H. sup.</th><th class="r">Déplacements</th><th class="r">Missions HW</th><th class="r">Brut</th><th class="r">Avances</th><th class="r">Net à payer</th></tr></thead><tbody>' +
+        '<div class="o-table-scroll"><table class="o-list"><thead><tr><th>Employé</th><th class="r">Tarif/jour</th><th class="r">Jours payés</th><th class="r">H. sup.</th><th class="r">Déplacements</th><th class="r">Missions HW</th><th class="r">Brut</th><th class="r">Avances</th><th class="r">Net à payer</th></tr></thead><tbody>' +
         salBody +
         '<tr style="background:var(--o-bg-soft,#f6f7f9);font-weight:700"><td>Total ' + salVis.length + ' employé(s)</td>' +
-          '<td class="r">' + num(totJours) + ' j</td><td class="r">' + num(totHS) + ' h</td><td class="r">' + num(totDep) + '</td><td></td>' +
+          '<td></td><td class="r">' + num(totJours) + ' j</td><td class="r">' + num(totHS) + ' h</td><td class="r">' + num(totDep) + '</td><td></td>' +
           '<td class="r">' + money(totBrut) + '</td><td class="r">' + money(totAv) + '</td><td class="r" style="color:#0f766e">' + money(totNet) + '</td></tr>' +
         '</tbody></table></div></div></div>' : '') +
             '<div class="o-list-wrap"><div class="o-table-scroll"><table class="o-list">' +
@@ -3124,18 +3107,20 @@
     if (s) s.onclick = function () { navigate('users'); };
   }
   function openPointModal(empId) {
+    var empDef = empId ? (S.refs.users || []).filter(function (u) { return u.id === empId; })[0] : null;
     openModal('Pointer une journée de travail',
       '<div class="o-form-grid">' +
         fieldHTML({ k: 'empId', l: 'Employé', t: 'rel', rel: 'users', req: true }, empId || '') +
         fieldHTML({ k: 'date', l: 'Date du jour', t: 'date', req: true }, todayKey()) +
         fieldHTML({ k: 'type', l: 'Type', t: 'select', opts: ['ARRIVÉE', 'PAUSE', 'REPRISE', 'DÉPART'] }, 'ARRIVÉE') +
         fieldHTML({ k: 'heuresSup', l: 'Heures supplémentaires (375 DA/h)', t: 'number', placeholder: 'Ex : 2' }, 0) +
+        fieldHTML({ k: 'tauxJournalier', l: 'Chiffre journalier (DA) — vide = tarif de l’employé', t: 'number', placeholder: 'Ex : 2000' }, (empDef && empDef.tauxJournalier) || '') +
         fieldHTML({ k: 'deplacement', l: 'Déplacement — frais de véhicule (+2 000 DA)', t: 'select', opts: ['Non', 'Oui'] }, 'Non') +
         fieldHTML({ k: 'mission', l: 'Mission (réf. / objet)', placeholder: 'Ex : M-ESSENIA-08' }, '') +
         fieldHTML({ k: 'horsWilaya', l: 'Mission hors wilaya (+1 200 DA forfaitaires)', t: 'select', opts: ['Non', 'Oui'] }, 'Non') +
         fieldHTML({ k: 'lieu', l: 'Lieu / chantier' }, S.lastPointLieu || '') +
         fieldHTML({ k: 'note', l: 'Note (facultatif)', full: true }, '') +
-        '<div class="full o-help">Seule une <b>ARRIVÉE</b> déclenche le paiement de la journée. Le forfait hors wilaya (1 200 DA) est versé <b>une seule fois par mission</b> (même référence). La position GPS est facultative.</div>' +
+        '<div class="full o-help">Seule une <b>ARRIVÉE</b> déclenche le paiement de la journée. Le <b>chiffre journalier</b> est repris du tarif de l’employé (défini dans sa fiche, 2 000 DA par défaut) ou saisi ci-dessus pour ce jour précis. Le forfait hors wilaya (1 200 DA) est versé <b>une seule fois par mission</b>. La position GPS est facultative.</div>' +
       '</div>',
       async function (data) {
         var gps = '—';
@@ -3150,6 +3135,7 @@
           await api('/api/pointages/point', { method: 'POST', body: {
             empId: data.empId, type: data.type, date: data.date, lieu: data.lieu,
             heuresSup: Number(data.heuresSup || 0),
+            tauxJournalier: data.tauxJournalier,
             deplacement: data.deplacement === 'Oui' ? 1 : 0,
             horsWilaya: data.horsWilaya === 'Oui' ? 1 : 0,
             mission: data.mission,

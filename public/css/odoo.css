@@ -2256,3 +2256,18 @@ body.side-hidden .o-main{margin-left:0!important}
 .o-preview-actions{display:flex;gap:8px}
 .o-preview-frame{flex:1;width:100%;border:0;background:#fff}
 @media (max-width:700px){.o-preview{height:96vh;width:98vw}.o-preview-bg{padding:6px}}
+
+/* ---------- LOGIN : logo 3D qui tourne, email et mot de passe seulement ---------- */
+.o-auth-only{display:flex;align-items:center;justify-content:center;grid-template-columns:none;padding:20px}
+.o-login-wrap{width:min(380px,100%);display:flex;flex-direction:column;align-items:center;gap:26px}
+.o-auth-only .o-logo-card{width:150px;height:150px}
+.o-auth-only .o-logo-face{border-radius:24px;padding:12px;box-shadow:0 18px 50px rgba(0,0,0,.36)}
+.o-auth-only .o-logo-3d{animation:oLogoSpin 5s linear infinite}
+@keyframes oLogoSpin{from{transform:rotateY(0deg)}to{transform:rotateY(360deg)}}
+.o-login-form{width:100%;display:grid;gap:10px}
+.o-login-form .o-input{height:42px;text-align:center}
+.o-login-submit{width:100%;height:42px;border:0;border-radius:8px;background:#017E84;color:#fff;display:grid;place-items:center;cursor:pointer}
+.o-login-submit svg{width:22px;height:22px;stroke:currentColor}
+.o-login-submit.busy{opacity:.6;cursor:wait}
+.o-auth-only .o-auth-err{text-align:center;margin:0}
+@media (prefers-reduced-motion:reduce){.o-auth-only .o-logo-3d{animation:none}}

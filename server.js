@@ -201,6 +201,8 @@ const MIGRATIONS = [
   ['devis', 'proformaNum', 'TEXT'],
   ['factures', 'blNum', 'TEXT'],
   ['devis', 'modePaiement', 'TEXT'],
+  ['users', 'tauxJournalier', 'REAL DEFAULT 2000'],
+  ['pointages', 'tauxJournalier', 'REAL'],
 ];
 
 /* ---------------- PÔLES / SERVICES (stock, ventes et achats séparés) ---------------- */
@@ -508,21 +510,30 @@ function missionKey(p) {
 /* Calcule la part quotidienne d'un pointage (une ARRIVÉE = une journée payée).
    Le forfait « hors wilaya » est ajouté une seule fois par mission lors de la
    feuille de salaire (voir salairesPointage), pas ici, pour éviter les doublons. */
-function calculerMontantPointage(p) {
+/* Le tarif journalier est propre à chaque employé (2 000 DA par défaut) et
+   peut être saisi/ajusté par l'administrateur lors du pointage. Le taux est
+   figé sur le pointage pour ne pas modifier rétroactivement un salaire. */
+function calculerMontantPointage(p, taux) {
   const actif = isArrivee(p);
   const jours = actif ? 1 : 0;
   const heuresSup = actif ? Math.max(0, Number(p.heuresSup || 0)) : 0;
   const deplacements = actif && Number(p.deplacement) ? 1 : 0;
-  const brutJours = round2(jours * PAIE.jour);
+  const brutJours = round2(jours * tauxJournalier(p, taux));
   const brutHS = round2(heuresSup * PAIE.heureSup);
   const brutDep = round2(deplacements * PAIE.deplacement);
   return {
     jours, heuresSup, deplacements,
     horsWilaya: actif && Number(p.horsWilaya) ? 1 : 0,
     mission: missionKey(p),
+    tauxJournalier: tauxJournalier(p, taux),
     brutJours, brutHS, brutDep,
     total: round2(brutJours + brutHS + brutDep),
   };
+}
+
+function tauxJournalier(p, override) {
+  const v = Number(override != null ? override : (p && p.tauxJournalier));
+  return Number(v) > 0 ? round2(v) : PAIE.jour;
 }
 
 /* Solde de la caisse : entrées − sorties − avances versées. */
@@ -535,7 +546,7 @@ function soldeCaisse(rows) {
 
 /* Feuille de salaire calculée depuis les pointages d'un mois (ou de toutes les périodes). */
 async function salairesPointage(mois) {
-  const users = (await db.prepare('SELECT id,name,role,active,salaire FROM users ORDER BY name').all());
+  const users = (await db.prepare('SELECT id,name,role,active,salaire,tauxJournalier FROM users ORDER BY name').all());
   const pts = mois
     ? (await db.prepare("SELECT * FROM pointages WHERE substr(COALESCE(date, substr(ts,1,10)),1,7) = ?").all(mois))
     : (await db.prepare('SELECT * FROM pointages').all());
@@ -544,13 +555,13 @@ async function salairesPointage(mois) {
     : (await db.prepare("SELECT * FROM caisse WHERE type = 'Avance'").all());
 
   return users.map((u) => {
-    let jours = 0, heuresSup = 0, deplacements = 0, brut = 0, nb = 0;
+    let jours = 0, heuresSup = 0, deplacements = 0, brut = 0, nb = 0, brutJoursCalc = 0;
     const missionsHW = new Set();
     pts.forEach((p) => {
       if (p.empId !== u.id) return;
       const c = calculerMontantPointage(p);
       jours += c.jours; heuresSup += c.heuresSup; deplacements += c.deplacements;
-      brut += c.total; nb += 1;
+      brut += c.total; brutJoursCalc += c.brutJours; nb += 1;
       /* Forfait hors wilaya : versé une seule fois par mission (référence ou date). */
       if (c.horsWilaya) missionsHW.add(c.mission);
     });
@@ -560,9 +571,10 @@ async function salairesPointage(mois) {
     const brutTotal = round2(brut + brutHW);
     return {
       empId: u.id, emp: u.name, role: u.role, active: u.active, reference: num(u.salaire),
+      tauxJournalier: tauxJournalier(u),
       mois: mois || '', jours, heuresSup, deplacements, pointages: nb,
       missionsHorsWilaya, brutHW,
-      brutJours: round2(jours * PAIE.jour),
+      brutJours: round2(brutJoursCalc),
       brutHS: round2(heuresSup * PAIE.heureSup),
       brutDep: round2(deplacements * PAIE.deplacement),
       brut: brutTotal, avances, net: round2(brutTotal - avances),
@@ -899,12 +911,12 @@ const COLLECTIONS = {
   interventions: ['titre', 'clientId', 'projetId', 'techId', 'date', 'duree', 'status', 'lieu'],
   maintenance: ['eq', 'lieu', 'clientId', 'type', 'next', 'status', 'techId'],
   stock: ['ref', 'nom', 'cat', 'service', 'qty', 'minQty', 'loc', 'prix', 'fournisseur'],
-  pointages: ['empId', 'emp', 'type', 'ts', 'gps', 'lieu', 'date', 'heuresSup', 'deplacement', 'montant', 'note', 'horsWilaya', 'mission'],
+  pointages: ['empId', 'emp', 'type', 'ts', 'gps', 'lieu', 'date', 'heuresSup', 'deplacement', 'montant', 'note', 'tauxJournalier', 'horsWilaya', 'mission'],
   contrats: ['type', 'clientId', 'ref', 'objet', 'service', 'dateDep', 'dateFin', 'montant', 'statut', 'periodicite', 'prochaineFacture', 'sla', 'sites'],
   equipements: ['clientId', 'site', 'cat', 'service', 'marque', 'modele', 'serial', 'qty', 'dateInstall', 'garantie', 'nextCtrl', 'status', 'notes'],
   solaire: ['client', 'toiture', 'conso', 'kwc', 'production', 'rentabilite', 'cout', 'statut'],
   documents: ['nom', 'cat', 'clientId'],
-  users: ['name', 'email', 'role', 'phone', 'active', 'salaire', 'perms', 'services'],
+  users: ['name', 'email', 'role', 'phone', 'active', 'salaire', 'tauxJournalier', 'perms', 'services'],
   assurances: ['empId', 'type', 'assureur', 'numero', 'prime', 'dateDebut', 'dateFin', 'statut', 'couverture', 'piece', 'notes'],
   mouvements: ['type', 'service', 'date', 'clientId', 'tiers', 'lignes', 'totalHT', 'tva', 'totalTTC', 'statut', 'modePaiement', 'notes'],
   depenses: ['date', 'libelle', 'categorie', 'montant', 'modePaiement', 'ref', 'notes'],
@@ -2518,25 +2530,28 @@ async function handle(req, res) {
      + frais de véhicule (2000 DA/déplacement) + 1200 DA forfaitaires / mission hors wilaya. */
   if (parts[0] === 'api' && parts[1] === 'pointages' && parts[2] === 'point' && method === 'POST') {
     if (!canModule(me, 'pointage')) return send(res, 403, { error: 'Accès non autorisé' });
-    const { empId, type, lieu, gps, date, heuresSup, deplacement, note, horsWilaya, mission } = await readBody(req);
+    const { empId, type, lieu, gps, date, heuresSup, deplacement, note, horsWilaya, mission, tauxJournalier: tauxSaisi } = await readBody(req);
     const u = (await db.prepare('SELECT * FROM users WHERE id = ?').get(empId));
     if (!u) return send(res, 404, { error: 'Employé introuvable' });
     const day = String(date || todayStr()).slice(0, 10);
+    const tauxJour = tauxJournalier({ tauxJournalier: tauxSaisi != null ? tauxSaisi : u.tauxJournalier });
     const p = {
       type: type || 'ARRIVÉE', heuresSup: Number(heuresSup || 0),
       deplacement: Number(deplacement) ? 1 : 0,
       horsWilaya: Number(horsWilaya) ? 1 : 0, mission: mission || '',
+      tauxJournalier: tauxJour,
     };
-    const calc = calculerMontantPointage(p);
+    const calc = calculerMontantPointage(p, tauxJour);
     const row = {
       id: uid('pt'), empId, emp: u.name, type: p.type,
       ts: day + 'T' + new Date().toTimeString().slice(0, 8),
       gps: gps || '—', lieu: lieu || '', date: day,
       heuresSup: calc.heuresSup, deplacement: calc.deplacements, montant: calc.total, note: note || '',
+      tauxJournalier: tauxJour,
       horsWilaya: calc.horsWilaya, mission: String(mission || ''),
     };
-    (await db.prepare('INSERT INTO pointages (id,empId,emp,type,ts,gps,lieu,date,heuresSup,deplacement,montant,note,horsWilaya,mission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(row.id, row.empId, row.emp, row.type, row.ts, row.gps, row.lieu, row.date, row.heuresSup, row.deplacement, row.montant, row.note, row.horsWilaya, row.mission));
+    (await db.prepare('INSERT INTO pointages (id,empId,emp,type,ts,gps,lieu,date,heuresSup,deplacement,montant,note,tauxJournalier,horsWilaya,mission) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.id, row.empId, row.emp, row.type, row.ts, row.gps, row.lieu, row.date, row.heuresSup, row.deplacement, row.montant, row.note, row.tauxJournalier, row.horsWilaya, row.mission));
     (await audit(me.name, `Pointage manuel ${row.type} — ${row.emp} (${row.montant} DA)`));
     return send(res, 201, row);
   }
@@ -2860,7 +2875,7 @@ async function handle(req, res) {
       const q = (url.searchParams.get('q') || '').trim().toLowerCase();
       let rows = (await db.prepare(`SELECT * FROM ${col}`).all());
       if (col === 'devis') rows = await Promise.all(rows.map(getDevis));
-      if (col === 'users') rows = rows.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, phone: u.phone, active: u.active, salaire: u.salaire, perms: u.perms, services: u.services, created: u.created }));
+      if (col === 'users') rows = rows.map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, phone: u.phone, active: u.active, salaire: u.salaire, tauxJournalier: u.tauxJournalier, perms: u.perms, services: u.services, created: u.created }));
       if (q) {
         rows = rows.filter((r) => Object.values(r).some((v) => String(v == null ? '' : v).toLowerCase().includes(q)));
       }
@@ -2958,14 +2973,13 @@ async function handle(req, res) {
         body.dateDep = String(body.dateDep || todayStr()).slice(0, 10);
         if (!body.prochaineFacture) body.prochaineFacture = body.dateDep;
       }
-      if (col === 'pointages' && body.empId && !body.emp) {
-        const emp = (await db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId));
-        body.emp = emp ? emp.name : '—';
-      }
       if (col === 'pointages') {
+        const emp = body.empId ? (await db.prepare('SELECT name,tauxJournalier FROM users WHERE id = ?').get(body.empId)) : null;
+        if (emp && !body.emp) body.emp = emp.name;
         body.date = String(body.date || todayStr()).slice(0, 10);
         body.ts = body.ts || (body.date + 'T' + new Date().toTimeString().slice(0, 8));
-        body.montant = calculerMontantPointage(body).total;
+        body.tauxJournalier = tauxJournalier({ tauxJournalier: body.tauxJournalier != null ? body.tauxJournalier : (emp && emp.tauxJournalier) });
+        body.montant = calculerMontantPointage(body, body.tauxJournalier).total;
       }
       if (col === 'caisse') {
         body.date = String(body.date || todayStr()).slice(0, 10);
@@ -3003,7 +3017,7 @@ async function handle(req, res) {
       const vals = [newId, ...fields.map((f) => {
         if (f === 'pass') return hashPass(body.pass || 'tech123');
         if (f === 'active') return body[f] == null || body[f] === '' ? 1 : (Number(body[f]) ? 1 : 0);
-        if (['qty', 'minQty', 'prix', 'tva', 'montant', 'paye', 'progress', 'duree', 'toiture', 'conso', 'kwc', 'production', 'rentabilite', 'cout', 'totalHT', 'totalTTC', 'salaire', 'prime', 'heuresSup'].includes(f)) return Number(body[f] || 0);
+        if (['qty', 'minQty', 'prix', 'tva', 'montant', 'paye', 'progress', 'duree', 'toiture', 'conso', 'kwc', 'production', 'rentabilite', 'cout', 'totalHT', 'totalTTC', 'salaire', 'prime', 'heuresSup', 'tauxJournalier'].includes(f)) return Number(body[f] || 0);
         if (f === 'deplacement' || f === 'horsWilaya') return Number(body[f]) ? 1 : 0;
         return body[f] == null ? '' : body[f];
       }), now()];
@@ -3055,8 +3069,13 @@ async function handle(req, res) {
         if (!canModule(me, String(candType || '').toLowerCase().indexOf('vente') === 0 ? 'mouvements' : 'achats')) return send(res, 403, { error: 'Accès non autorisé à ce type de mouvement' });
         if (body.lignes !== undefined) body.lignes = JSON.stringify(body.lignes || []);
       }
-      if (col === 'pointages' && (body.type !== undefined || body.heuresSup !== undefined || body.deplacement !== undefined || body.horsWilaya !== undefined || body.mission !== undefined)) {
-        body.montant = calculerMontantPointage({ ...existing, ...body }).total;
+      if (col === 'pointages' && (body.type !== undefined || body.heuresSup !== undefined || body.deplacement !== undefined || body.horsWilaya !== undefined || body.mission !== undefined || body.tauxJournalier !== undefined)) {
+        const emp = existing.empId ? (await db.prepare('SELECT tauxJournalier FROM users WHERE id = ?').get(existing.empId)) : null;
+        body.tauxJournalier = tauxJournalier({
+          tauxJournalier: body.tauxJournalier != null ? body.tauxJournalier
+            : (existing.tauxJournalier != null ? existing.tauxJournalier : (emp && emp.tauxJournalier)),
+        });
+        body.montant = calculerMontantPointage({ ...existing, ...body }, body.tauxJournalier).total;
       }
       if (col === 'caisse' && body.type === 'Avance' && body.empId && !body.emp) {
         const emp = (await db.prepare('SELECT name FROM users WHERE id = ?').get(body.empId));
@@ -3126,7 +3145,7 @@ async function handle(req, res) {
         sets.push(`${f} = ?`);
         if (f === 'pass') vals.push(hashPass(body.pass));
         else if (f === 'deplacement' || f === 'horsWilaya') vals.push(Number(body[f]) ? 1 : 0);
-        else if (['qty', 'minQty', 'prix', 'montant', 'paye', 'progress', 'duree', 'toiture', 'conso', 'kwc', 'production', 'rentabilite', 'cout', 'tva', 'totalHT', 'totalTTC', 'salaire', 'prime', 'heuresSup'].includes(f)) vals.push(Number(body[f] || 0));
+        else if (['qty', 'minQty', 'prix', 'montant', 'paye', 'progress', 'duree', 'toiture', 'conso', 'kwc', 'production', 'rentabilite', 'cout', 'tva', 'totalHT', 'totalTTC', 'salaire', 'prime', 'heuresSup', 'tauxJournalier'].includes(f)) vals.push(Number(body[f] || 0));
         else vals.push(body[f]);
       });
       if (sets.length) {
