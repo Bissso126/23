@@ -2247,3 +2247,12 @@ body.side-hidden .o-main{margin-left:0!important}
 @media (prefers-reduced-motion:reduce){
   .dash *{animation:none!important;transition:none!important}
 }
+
+/* Aperçu des documents (avant impression / téléchargement) */
+.o-preview-bg{position:fixed;inset:0;z-index:1000;background:rgba(15,23,42,.58);display:flex;align-items:center;justify-content:center;padding:18px}
+.o-preview{background:#fff;width:min(1120px,96vw);height:92vh;border-radius:10px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(0,0,0,.38)}
+.o-preview-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:#0f2b46;color:#fff}
+.o-preview-head b{font-size:13px;letter-spacing:.2px}
+.o-preview-actions{display:flex;gap:8px}
+.o-preview-frame{flex:1;width:100%;border:0;background:#fff}
+@media (max-width:700px){.o-preview{height:96vh;width:98vw}.o-preview-bg{padding:6px}}

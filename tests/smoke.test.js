@@ -102,6 +102,53 @@ test('numérotation atomique : deux devis simultanés ont des numéros différen
   assert.notEqual(a.body.num, b.body.num);
 });
 
+test('les 4 documents commerciaux sont imprimables et numérotés une seule fois', async () => {
+  const html = (r) => (Buffer.isBuffer(r.body) ? r.body.toString('utf8') : String(r.body));
+  const d = await api('/api/devis', {
+    method: 'POST',
+    body: JSON.stringify({
+      titre: 'Détection incendie', service: 'INC', tva: 19, validite: '2 jours',
+      lignes: [
+        { description: 'Coffret de relayage', qty: 2, pu: 150000 },
+        { description: 'Bouton arrêt pompiers', qty: 2, pu: 6500 },
+      ],
+    }),
+  });
+  assert.equal(d.status, 201);
+
+  const bc1 = await api('/api/devis/' + d.body.id + '/bon-commande');
+  const bc2 = await api('/api/devis/' + d.body.id + '/bon-commande');
+  assert.equal(bc1.status, 200);
+  assert.match(html(bc1), /BON DE COMMANDE N° : BC-\d{4}-\d{3}/);
+  const bcNum = html(bc1).match(/BON DE COMMANDE N° : (BC-[0-9-]+)/)[1];
+  assert.ok(html(bc2).includes(bcNum), 'le numéro du bon de commande doit rester stable');
+
+  const pf1 = await api('/api/devis/' + d.body.id + '/proforma');
+  const pf2 = await api('/api/devis/' + d.body.id + '/proforma');
+  assert.equal(pf1.status, 200);
+  assert.match(html(pf1), /FACTURE PROFORMA N° : PF-\d{4}-\d{3}/);
+  const pfNum = html(pf1).match(/FACTURE PROFORMA N° : (PF-[0-9-]+)/)[1];
+  assert.ok(html(pf2).includes(pfNum), 'le numéro de la proforma doit rester stable');
+  assert.ok(html(pf1).includes('A4 landscape'), 'la proforma reprend le format paysage du modèle');
+
+  const f = await api('/api/devis/' + d.body.id + '/facture', { method: 'POST' });
+  assert.equal(f.status, 201);
+  const fp = await api('/api/factures/' + f.body.id + '/print');
+  assert.equal(fp.status, 200);
+  assert.ok(html(fp).includes('Facture N° :'));
+
+  const bl1 = await api('/api/factures/' + f.body.id + '/bon-livraison');
+  const bl2 = await api('/api/factures/' + f.body.id + '/bon-livraison');
+  assert.equal(bl1.status, 200);
+  assert.match(html(bl1), /Bon de livraison N° : BL-\d{4}-\d{3}/);
+  const blNum = html(bl1).match(/Bon de livraison N° : (BL-[0-9-]+)/)[1];
+  assert.ok(html(bl2).includes(blNum), 'le numéro du bon de livraison doit rester stable');
+
+  const embed = await api('/api/factures/' + f.body.id + '/print?embed=1');
+  assert.equal(embed.status, 200);
+  assert.ok(!html(embed).includes('Imprimer / PDF'), 'le mode aperçu masque la barre d’impression');
+});
+
 test('sauvegarde : réservée à l’admin ou au token dédié', async () => {
   const denied = await fetch(base + '/api/backup');
   assert.equal(denied.status, 401);

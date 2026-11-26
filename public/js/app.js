@@ -424,6 +424,7 @@
         { k: 'titre', l: 'Objet', req: true, full: true },
         { k: 'service', l: 'Pôle / service', t: 'select', opts: POLE_OPTS, req: true },
         { k: 'validite', l: 'Validité', t: 'select', opts: ['15 jours', '30 jours', '45 jours', '60 jours', '90 jours'] },
+        { k: 'modePaiement', l: 'Mode de paiement', t: 'select', opts: ['chèque', 'virement', 'espèces', 'traite'] },
         { k: 'tva', l: 'TVA %', t: 'number' },
         { k: 'status', l: 'Statut', t: 'select', opts: ['brouillon', 'envoyé', 'accepté', 'refusé'] },
       ],
@@ -437,6 +438,7 @@
         { k: 'act', l: '', fn: function (r) {
           return '<button class="o-btn o-btn-default o-btn-sm" data-print-devis="' + esc(r.id) + '" title="Imprimer le devis">' + icon('printer') + '</button> ' +
             '<button class="o-btn o-btn-default o-btn-sm" data-bc-devis="' + esc(r.id) + '" title="Imprimer le bon de commande">' + icon('file') + ' BC</button> ' +
+            '<button class="o-btn o-btn-default o-btn-sm" data-pf-devis="' + esc(r.id) + '" title="Imprimer la facture proforma">' + icon('file') + ' PF</button> ' +
             '<button class="o-btn o-btn-purple o-btn-sm" data-conv-devis="' + esc(r.id) + '">Facturer</button>';
         } },
       ],
@@ -466,6 +468,7 @@
         { k: 'act', l: '', fn: function (r) {
           var reste = Number(r.montant || 0) - Number(r.paye || 0);
           return '<button class="o-btn o-btn-default o-btn-sm" data-print-facture="' + esc(r.id) + '">' + icon('printer') + ' Imprimer</button>' +
+            ' <button class="o-btn o-btn-default o-btn-sm" data-bl-facture="' + esc(r.id) + '" title="Imprimer le bon de livraison">' + icon('file') + ' BL</button>' +
             (reste > 0 ? ' <button class="o-btn o-btn-primary o-btn-sm" data-pay-facture="' + esc(r.id) + '">Encaisser</button>' : '');
         } },
       ],
@@ -955,19 +958,6 @@
     }).join('');
   }
 
-  function sideTabHtml() {
-    var keys = (S.sideTab === 'recent' ? recents() : favs()).slice();
-    var items = keys.map(appDef).filter(Boolean);
-    if (!items.length) {
-      return '<div class="side-empty">' + (S.sideTab === 'recent' ? 'Les applications ouvertes apparaîtront ici.' : 'Aucune application épinglée.') + '</div>';
-    }
-    return items.map(function (a) {
-      return '<button class="s-recent" data-side-mod="' + a.k + '">' +
-        '<span class="s-ico sm">' + appArt(a.k, a.icon) + '</span>' +
-        '<span class="s-lbl">' + esc(a.l) + '</span></button>';
-    }).join('');
-  }
-
   function renderSide() {
     var side = document.getElementById('side');
     if (!side) return;
@@ -992,11 +982,6 @@
           '<button data-side-tool="hide" title="Masquer complètement le menu">' + icon('chevronLeft') + '</button>' +
         '</span></div>' +
       '<div class="side-apps" id="side-apps">' + sideAppsHtml() + '</div>' +
-      '<div class="side-tabs">' +
-        '<button class="' + (S.sideTab === 'fav' ? 'active' : '') + '" data-side-tab="fav" title="Favoris">' + icon('bookmark') + '<span>Favoris</span></button>' +
-        '<button class="' + (S.sideTab === 'recent' ? 'active' : '') + '" data-side-tab="recent" title="Récents">' + icon('clock') + '<span>Récents</span></button>' +
-      '</div>' +
-      '<div class="side-list">' + sideTabHtml() + '</div>' +
       '<div class="side-foot">' +
         '<button class="sf-av" data-side-tool="account" title="Mon compte / mot de passe">' + esc((S.user.name || 'A')[0]) + '</button>' +
         '<button class="sf-who" data-side-tool="account" title="Mon compte / mot de passe"><b>' + esc(S.user.name) + '</b><small>' + esc(S.user.role) + '</small></button>' +
@@ -1021,8 +1006,6 @@
         toast(added ? 'Application épinglée aux favoris' : 'Application retirée des favoris', 'ok');
         return;
       }
-      var tab = e.target.closest('[data-side-tab]');
-      if (tab) { S.sideTab = tab.getAttribute('data-side-tab'); renderSide(); return; }
       var tool = e.target.closest('[data-side-tool]');
       if (tool) { sideTool(tool.getAttribute('data-side-tool')); return; }
       if (e.target.closest('[data-side-home]')) { navigate('apps'); return; }
@@ -4142,13 +4125,14 @@
   function openDevisForm(row, id) {
     var lignes = row.lignes && row.lignes.length ? row.lignes : [{ description: '', qty: 1, pu: 0 }];
     var body =
-      (id ? '<div style="margin-bottom:10px"><button type="button" class="o-btn o-btn-default o-btn-sm" id="dl-print">' + icon('printer') + ' Imprimer le devis</button> <button type="button" class="o-btn o-btn-default o-btn-sm" id="dl-bc">' + icon('file') + ' Bon de commande</button></div>' : '') +
+      (id ? '<div style="margin-bottom:10px"><button type="button" class="o-btn o-btn-default o-btn-sm" id="dl-print">' + icon('printer') + ' Imprimer le devis</button> <button type="button" class="o-btn o-btn-default o-btn-sm" id="dl-bc">' + icon('file') + ' Bon de commande</button> <button type="button" class="o-btn o-btn-default o-btn-sm" id="dl-pf">' + icon('file') + ' Facture proforma</button></div>' : '') +
       '<div class="o-form-grid">' +
         fieldHTML({ k: 'clientId', l: 'Client', t: 'rel', rel: 'clients', req: true }, row.clientId || '') +
         fieldHTML({ k: 'service', l: 'Pôle / service', t: 'select', opts: POLE_OPTS, req: true }, row.service || (S.poleFilter || '') || 'COMMUN') +
         fieldHTML({ k: 'tva', l: 'TVA %', t: 'number' }, row.tva != null ? row.tva : 19) +
         '<div class="full">' + fieldHTML({ k: 'titre', l: 'Objet', req: true }, row.titre || '') + '</div>' +
         fieldHTML({ k: 'validite', l: 'Validité', t: 'select', opts: ['15 jours', '30 jours', '45 jours', '60 jours', '90 jours'] }, row.validite || '30 jours') +
+        fieldHTML({ k: 'modePaiement', l: 'Mode de paiement', t: 'select', opts: ['chèque', 'virement', 'espèces', 'traite'] }, row.modePaiement || 'chèque') +
         fieldHTML({ k: 'status', l: 'Statut', t: 'select', opts: ['brouillon', 'envoyé', 'accepté', 'refusé'] }, row.status || 'brouillon') +
         fieldHTML({ k: 'remise', l: 'Remise commerciale (%)', t: 'number' }, row.remise != null ? row.remise : 0) +
       '</div>' +
@@ -4190,13 +4174,19 @@
     var printBtn = document.getElementById('dl-print');
     if (printBtn) {
       printBtn.onclick = function () {
-        window.open('/api/devis/' + encodeURIComponent(id) + '/print?token=' + encodeURIComponent(token()), '_blank');
+        previewDoc('/api/devis/' + encodeURIComponent(id) + '/print?token=' + encodeURIComponent(token()), 'Devis ' + (row.num || ''));
       };
     }
     var bcBtn = document.getElementById('dl-bc');
     if (bcBtn) {
       bcBtn.onclick = function () {
-        window.open('/api/devis/' + encodeURIComponent(id) + '/bon-commande?token=' + encodeURIComponent(token()), '_blank');
+        previewDoc('/api/devis/' + encodeURIComponent(id) + '/bon-commande?token=' + encodeURIComponent(token()), 'Bon de commande');
+      };
+    }
+    var pfBtn = document.getElementById('dl-pf');
+    if (pfBtn) {
+      pfBtn.onclick = function () {
+        previewDoc('/api/devis/' + encodeURIComponent(id) + '/proforma?token=' + encodeURIComponent(token()), 'Facture proforma');
       };
     }
     document.getElementById('dl-ai').onclick = async function () {
@@ -4294,24 +4284,59 @@
   }
   function closeModal() { document.getElementById('modal-root').innerHTML = ''; }
 
+  /* Aperçu d'un document dans l'application avant impression / téléchargement */
+  function previewDoc(url, title) {
+    var root = document.getElementById('modal-root');
+    var embedUrl = url + (url.indexOf('?') === -1 ? '?' : '&') + 'embed=1';
+    root.innerHTML =
+      '<div class="o-preview-bg">' +
+        '<div class="o-preview">' +
+          '<div class="o-preview-head"><b>' + esc(title) + '</b>' +
+            '<div class="o-preview-actions">' +
+              '<button class="o-btn o-btn-default o-btn-sm" data-preview-download>' + icon('download') + ' Imprimer / PDF</button>' +
+              '<button class="o-btn o-btn-primary o-btn-sm" data-preview-close>Fermer</button>' +
+            '</div>' +
+          '</div>' +
+          '<iframe class="o-preview-frame" src="' + esc(embedUrl) + '" title="' + esc(title) + '"></iframe>' +
+        '</div>' +
+      '</div>';
+    root.querySelector('[data-preview-close]').onclick = closeModal;
+    root.querySelector('[data-preview-download]').onclick = function () { window.open(url, '_blank'); };
+    root.querySelector('.o-preview-bg').onclick = function (e) {
+      if (e.target.classList.contains('o-preview-bg')) closeModal();
+    };
+  }
+
   /* ---------------- GLOBAL ACTIONS ---------------- */
   document.addEventListener('click', async function (e) {
     var pf = e.target.closest('[data-print-facture]');
     if (pf) {
       e.preventDefault();
-      window.open('/api/factures/' + encodeURIComponent(pf.getAttribute('data-print-facture')) + '/print?token=' + encodeURIComponent(token()), '_blank');
+      previewDoc('/api/factures/' + encodeURIComponent(pf.getAttribute('data-print-facture')) + '/print?token=' + encodeURIComponent(token()), 'Facture');
+      return;
+    }
+    var bl = e.target.closest('[data-bl-facture]');
+    if (bl) {
+      e.preventDefault();
+      previewDoc('/api/factures/' + encodeURIComponent(bl.getAttribute('data-bl-facture')) + '/bon-livraison?token=' + encodeURIComponent(token()), 'Bon de livraison');
       return;
     }
     var pd = e.target.closest('[data-print-devis]');
     if (pd) {
       e.preventDefault();
-      window.open('/api/devis/' + encodeURIComponent(pd.getAttribute('data-print-devis')) + '/print?token=' + encodeURIComponent(token()), '_blank');
+      previewDoc('/api/devis/' + encodeURIComponent(pd.getAttribute('data-print-devis')) + '/print?token=' + encodeURIComponent(token()), 'Devis');
       return;
     }
     var bc = e.target.closest('[data-bc-devis]');
     if (bc) {
       e.preventDefault();
-      window.open('/api/devis/' + encodeURIComponent(bc.getAttribute('data-bc-devis')) + '/bon-commande?token=' + encodeURIComponent(token()), '_blank');
+      previewDoc('/api/devis/' + encodeURIComponent(bc.getAttribute('data-bc-devis')) + '/bon-commande?token=' + encodeURIComponent(token()), 'Bon de commande');
+      return;
+    }
+    var pf2 = e.target.closest('[data-pf-devis]');
+    if (pf2) {
+      e.preventDefault();
+      previewDoc('/api/devis/' + encodeURIComponent(pf2.getAttribute('data-pf-devis')) + '/proforma?token=' + encodeURIComponent(token()), 'Facture proforma');
       return;
     }
     var cd = e.target.closest('[data-conv-devis]');

@@ -197,6 +197,10 @@ const MIGRATIONS = [
   ['equipements', 'service', 'TEXT'],
   ['contrats', 'service', 'TEXT'],
   ['users', 'services', 'TEXT'],
+  ['devis', 'bcNum', 'TEXT'],
+  ['devis', 'proformaNum', 'TEXT'],
+  ['factures', 'blNum', 'TEXT'],
+  ['devis', 'modePaiement', 'TEXT'],
 ];
 
 /* ---------------- PÔLES / SERVICES (stock, ventes et achats séparés) ---------------- */
@@ -588,6 +592,17 @@ async function nextDocNumber(prefix, table, column = 'num', year) {
   const updated = (await db.prepare('UPDATE sequences SET value = value + 1 WHERE key = ? RETURNING value').get(key));
   const next = Number(updated ? updated.value : 1);
   return `${prefix}-${y}-${String(next).padStart(3, '0')}`;
+}
+
+/* Numéro d'une pièce annexe (bon de commande, facture proforma, bon de
+   livraison) : attribué une seule fois puis conservé sur l'enregistrement
+   source, afin qu'une réimpression porte toujours le même numéro. */
+async function ensureDocNumber(row, table, column, prefix) {
+  if (row && row[column]) return row[column];
+  const num = await nextDocNumber(prefix, table, column);
+  (await db.prepare(`UPDATE ${table} SET ${column} = ? WHERE id = ? AND (${column} IS NULL OR ${column} = '')`).run(num, row.id));
+  const fresh = (await db.prepare(`SELECT ${column} AS n FROM ${table} WHERE id = ?`).get(row.id));
+  return (fresh && fresh.n) || num;
 }
 
 function hashPass(pass) {
@@ -1586,6 +1601,13 @@ function h(s) {
 function moneyFr(n) {
   return Number(n || 0).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
+/* Les dates sont stockées en ISO (AAAA-MM-JJ) ; les modèles de documents
+   utilisent le format français JJ/MM/AAAA. */
+function dateDoc(v) {
+  const s = String(v || '').slice(0, 10);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : s;
+}
 async function factureDocData(f) {
   const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(f.clientId)) || {};
   const tva = Number(f.tva || CONFIG.company.vat || 19);
@@ -1639,9 +1661,16 @@ async function factureDocData(f) {
 function renderInvoiceHtml(o) {
   const co = CONFIG.company;
   const isDevis = o.docType === 'DEVIS';
-  const isBC = o.docType === 'BON DE COMMANDE';
-  const docLabel = isBC ? 'BON DE COMMANDE' : (isDevis ? 'DEVIS' : 'FACTURE');
-  const rows = o.lignes.map((l, i) => `
+  const isProforma = o.docType === 'FACTURE PROFORMA';
+  const isBL = o.docType === 'BON DE LIVRAISON';
+  const landscape = isProforma;
+  const docLabel = o.docType === 'BON DE COMMANDE' ? 'BON DE COMMANDE'
+    : (isProforma ? 'FACTURE PROFORMA'
+    : (isBL ? 'Bon de livraison' : (isDevis ? 'DEVIS' : 'Facture')));
+  const devise = co.currency || 'DA';
+  const client = o.client || {};
+  const validite = o.validite || (isDevis ? '' : (co.validiteOffre || '2 jours'));
+  const rows = (o.lignes || []).map((l, i) => `
     <tr>
       <td class="c">${i + 1}</td>
       <td>${h(l.designation)}</td>
@@ -1654,90 +1683,83 @@ function renderInvoiceHtml(o) {
   return `<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><title>${docLabel} ${h(o.numero)}</title>
 <style>
-  @page { size: A4; margin: 11mm 10mm; }
+  @page { size: A4 ${landscape ? 'landscape' : 'portrait'}; margin: 12mm 12mm; }
   * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; color:#111; font-size:11.5px; margin:0; }
-  .top { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
-  .brand img { height:84px; }
-  .co { text-align:right; line-height:1.45; font-size:10.5px; }
-  .co .name { color:#e11d1d; font-size:19px; font-weight:800; letter-spacing:.3px; }
-  .co .addr { margin:2px 0 3px; }
-  hr.red { border:0; border-top:2px solid #e11d1d; margin:8px 0 0; }
-  .meta { display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1.5px solid #e11d1d; padding:8px 0 7px; }
-  .meta .left b { font-size:16px; letter-spacing:.4px; }
-  .meta .left .ids { font-size:10px; line-height:1.5; margin-top:3px; }
-  .meta .right { text-align:right; font-weight:800; font-size:14px; }
-  .client { font-size:10.5px; line-height:1.5; margin:7px 0 10px; }
-  .client b { font-size:12px; }
-  table { width:100%; border-collapse:collapse; }
-  thead th { border:1px solid #111; background:#fff; font-size:10px; text-transform:uppercase; padding:5px 4px; }
-  tbody td { border:1px solid #111; padding:6px 5px; vertical-align:top; }
+  body { font-family: Arial, Helvetica, sans-serif; color:#111; font-size:11px; margin:0; }
+  .top { display:flex; justify-content:space-between; align-items:center; gap:18px; }
+  .brand img { height:78px; }
+  .co { text-align:right; line-height:1.5; font-size:10.5px; }
+  .co .name { color:#e11d1d; font-size:19px; font-weight:800; letter-spacing:.2px; text-transform:uppercase; }
+  .co .addr { margin:3px 0; }
+  hr.red { border:0; border-top:2.5px solid #e11d1d; margin:8px 0 0; }
+  .doc-line { display:flex; justify-content:space-between; align-items:baseline; gap:20px; border-bottom:2px solid #e11d1d; padding:7px 0 6px; font-weight:800; }
+  .doc-line .num { font-size:15px; }
+  .doc-line .date { font-size:12px; }
+  .client { font-size:10.5px; line-height:1.55; margin:5px 0 10px; }
+  .client .cl-row { display:flex; gap:12px; }
+  .client .cl-row > div:first-child { width:38%; }
+  .client .cl-row > div:last-child { flex:1; }
+  table.lines { width:100%; border-collapse:collapse; }
+  table.lines th { border:1px solid #111; padding:5px 4px; font-size:10px; text-transform:uppercase; background:#fff; }
+  table.lines td { border:1px solid #111; padding:6px 5px; vertical-align:top; }
   td.c, th.c { text-align:center; }
   td.r, th.r { text-align:right; }
-  .totals { width:46%; margin-left:auto; margin-top:8px; border:1px solid #111; }
-  .totals tr td { border:1px solid #111; padding:4px 8px; font-weight:700; }
-  .totals tr td:last-child { text-align:right; }
-  .lettres { margin-top:12px; font-size:11px; }
-  .foot { margin-top:26px; border-top:1.5px solid #111; padding-top:5px; display:flex; justify-content:space-between; font-size:10.5px; font-weight:700; }
-  .toolbar { position:fixed; top:10px; right:10px; }
+  .bottom { display:flex; justify-content:space-between; align-items:flex-start; gap:20px; margin-top:10px; }
+  .pay { font-size:11px; font-weight:700; padding-top:4px; }
+  table.totals { width:42%; border-collapse:collapse; margin-left:auto; }
+  table.totals td { border:1px solid #111; padding:4px 8px; font-weight:700; }
+  table.totals td:last-child { text-align:right; }
+  .lettres { margin-top:14px; font-size:11px; }
+  .foot { margin-top:34px; border-top:2px solid #111; padding-top:5px; display:flex; justify-content:space-between; font-size:10.5px; font-weight:700; }
+  .toolbar { position:fixed; top:10px; right:10px; z-index:9; }
   .toolbar button { background:#017E84; color:#fff; border:0; border-radius:5px; padding:9px 14px; font-weight:700; cursor:pointer; }
   @media print { .toolbar { display:none; } }
 </style></head>
 <body>
-  <div class="toolbar"><button onclick="window.print()">Imprimer / PDF</button></div>
+  ${o.embed ? '' : '<div class="toolbar"><button onclick="window.print()">Imprimer / PDF</button></div>'}
   <div class="top">
     <div class="brand"><img src="/assets/logo-header.png" alt="Advanced Security Systems"></div>
     <div class="co">
       <div class="name">${h(co.name)}</div>
       <div class="addr">${h(co.address)}</div>
-      <div>RC : ${h(co.rc)}</div>
-      <div>AI : ${h(co.ai)}</div>
-      <div>NIF : ${h(co.nif)}</div>
-      <div>NIS : ${h(co.nis)}</div>
+      <div>RC: ${h(co.rc)}</div>
+      <div>AI: ${h(co.ai)}</div>
+      <div>NIF: ${h(co.nif)}</div>
+      <div>NIS: ${h(co.nis)}</div>
     </div>
   </div>
   <hr class="red">
-  <div class="meta">
-    <div class="left">
-      <b>${docLabel} N° : ${h(o.numero)}</b>
-      <div class="ids">
-        RC : ${h(co.rc)}<br>NIF : ${h(co.nif)}<br>NIS : ${h(co.nis)}<br>TIN : ${h(co.tin || '')}${o.refDevis ? '<br>Réf. devis : ' + h(o.refDevis) : ''}
-      </div>
-    </div>
-    <div class="right">${h(o.date)}</div>
+  <div class="doc-line">
+    <span class="num">${docLabel} N° : ${h(o.numero)}</span>
+    <span class="date">${h(dateDoc(o.date))}</span>
   </div>
   <div class="client">
-    <b>CLIENT : ${h(o.client.name || '')}</b>
-    ${o.client.address ? '<br>' + h(o.client.address) : ''}
-    ${o.client.wilaya ? ' — ' + h(o.client.wilaya) : ''}
-    <br>RC : ${h(o.client.rc || '')} &nbsp; NIF : ${h(o.client.nif || '')} &nbsp; NIS : ${h(o.client.nis || '')} &nbsp; TIN : ${h(o.client.tin || '')}
-    ${o.objet ? '<br><b>Objet :</b> ' + h(o.objet) : ''}
+    <div class="cl-row"><div>RC: ${h(client.rc || '')}</div><div>CLIENT: ${h(client.name || '')}</div></div>
+    <div>NIF: ${h(client.nif || '')}</div>
+    <div>NIS : ${h(client.nis || '')}</div>
+    <div>TIN: ${h(client.tin || '')}</div>
+    ${o.objet ? '<div style="margin-top:3px"><b>Objet :</b> ' + h(o.objet) + '</div>' : ''}
   </div>
-  <table>
+  <table class="lines">
     <thead><tr>
-      <th class="c" style="width:4%">N°</th><th>DÉSIGNATION</th><th class="c" style="width:8%">UNITÉ</th>
-      <th class="r" style="width:10%">QUANTITÉ</th><th class="r" style="width:14%">PU HT</th>
-      <th class="r" style="width:15%">MONTANT HT</th><th class="c" style="width:7%">TVA</th>
+      <th class="c" style="width:4%">N°</th><th>DÉSIGNATION</th><th class="c" style="width:9%">UNITÉ</th>
+      <th class="r" style="width:11%">QUANTITÉ</th><th class="r" style="width:15%">PU HT</th>
+      <th class="r" style="width:16%">MONTANT HT</th><th class="c" style="width:7%">TVA</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>
-  <table class="totals">
-    ${o.remise > 0 ? '<tr><td>TOTAL BRUT H.T</td><td>' + moneyFr(o.ht + o.remise) + '</td></tr><tr><td>REMISE</td><td>-' + moneyFr(o.remise) + '</td></tr>' : ''}
-    <tr><td>TOTAL H.T</td><td>${moneyFr(o.ht)}</td></tr>
-    <tr><td>TOTAL T.V.A</td><td>${moneyFr(o.tvaMontant)}</td></tr>
-    <tr><td>TOTAL T.T.C</td><td>${moneyFr(o.ttc)}</td></tr>
-    ${!isDevis && !isBC && o.paye > 0 ? '<tr><td>DÉJÀ RÉGLÉ</td><td>' + moneyFr(o.paye) + '</td></tr><tr><td>RESTE À PAYER</td><td>' + moneyFr(Math.max(0, o.ttc - o.paye)) + '</td></tr>' : ''}
-  </table>
-  <div class="lettres">
-    Arrêtée la présente ${isBC ? 'commande' : (isDevis ? 'offre' : 'facture')} à la somme de :
-    <b>${h(montantEnLettres(o.ttc))}</b>.
+  <div class="bottom">
+    <div class="pay">${o.modePaiement ? 'Mode de paiement: <b>' + h(o.modePaiement) + '</b>' : ''}</div>
+    <table class="totals">
+      ${o.remise > 0 ? '<tr><td>TOTAL BRUT H.T</td><td>' + moneyFr(o.ht + o.remise) + ' ' + devise + '</td></tr><tr><td>REMISE</td><td>-' + moneyFr(o.remise) + ' ' + devise + '</td></tr>' : ''}
+      <tr><td>TOTAL H.T</td><td>${moneyFr(o.ht)} ${devise}</td></tr>
+      <tr><td>TOTAL T.V.A</td><td>${moneyFr(o.tvaMontant)} ${devise}</td></tr>
+      <tr><td>TOTAL T.T.C</td><td>${moneyFr(o.ttc)} ${devise}</td></tr>
+    </table>
   </div>
-  ${o.modePaiement ? '<div class="lettres">Mode de paiement : <b>' + h(o.modePaiement) + '</b></div>' : ''}
-  ${!isBC && o.validite ? '<div class="lettres">Validité offre : <b>' + h(o.validite) + '</b></div>' : ''}
-  ${!isDevis && !isBC && o.due ? '<div class="lettres">Échéance de règlement : <b>' + h(o.due) + '</b></div>' : ''}
-  ${!isDevis && !isBC && !o.payee ? '<div class="lettres" style="margin-top:10px;font-size:10px;color:#444">Règlement par virement bancaire ou chèque à l\'ordre de ' + h(co.name) + (co.bank ? ' — ' + h(co.bank) : '') + '.</div>' : ''}
-  ${isBC ? '<div style="display:flex;justify-content:space-between;gap:30px;margin-top:30px;font-size:10.5px"><div style="width:45%">Le client<br><span style="font-size:9.5px;color:#555">Nom, cachet et signature</span><div style="height:52px"></div><div style="border-top:1px solid #999"></div></div><div style="width:45%;text-align:right">Pour ' + h(co.name) + '<br><span style="font-size:9.5px;color:#555">Cachet et signature</span><div style="height:52px"></div><div style="border-top:1px solid #999"></div></div></div>' : ''}
-  <div class="foot"><span>EMAIL : ${h(co.email)}</span><span>N° Tél : ${h(co.phone)}</span></div>
+  <div class="lettres">Arrêtée la Présente ${isDevis ? 'offre' : 'facture'} à la Somme de: <b>${h(montantEnLettres(o.ttc))}</b>.</div>
+  ${validite ? '<div class="lettres">Validité offre: <b>' + h(validite) + '</b>.</div>' : ''}
+  <div class="foot"><span>EMAIL: ${h(co.email)}</span><span>N° Tél: ${h(co.phone)}</span></div>
 </body></html>`;
 }
 
@@ -2633,8 +2655,8 @@ async function handle(req, res) {
     const html = renderInvoiceHtml({
       docType: 'FACTURE', numero: f.num, date: f.date, client: data.client,
       lignes: data.lignes, ht: data.ht, tvaMontant: data.tvaMontant, ttc: data.ttc, remise: data.remise,
-      objet: f.objet || '', modePaiement: f.modePaiement || '', validite: '', due: f.due,
-      paye: Number(f.paye || 0), payee: String(f.status || '').toLowerCase() === 'payée',
+      objet: f.objet || '', modePaiement: f.modePaiement || '', validite: '',
+      embed: url.searchParams.get('embed') === '1',
     });
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(html);
@@ -2655,6 +2677,7 @@ async function handle(req, res) {
       docType: 'DEVIS', numero: d.num, date: d.date, client, lignes,
       ht: tot.ht, tvaMontant: tot.tva, ttc: tot.ttc, remise: tot.remise, objet: d.titre || '',
       modePaiement: '', validite: d.validite || '',
+      embed: url.searchParams.get('embed') === '1',
     });
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(html);
@@ -2665,17 +2688,57 @@ async function handle(req, res) {
     if (!canModule(me, 'devis')) return send(res, 403, { error: 'Accès non autorisé' });
     const d = (await getDevis(parts[2]));
     if (!d) return send(res, 404, { error: 'Devis introuvable' });
+    const numero = (await ensureDocNumber(d, 'devis', 'bcNum', 'BC'));
     const tot = devisTotal(d);
     const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId)) || {};
     const lignes = (d.lignes || []).map((l) => ({
       designation: l.description, unite: 'U', quantite: Number(l.qty || 0),
       pu: Number(l.pu || 0), montant: Number(l.qty || 0) * Number(l.pu || 0), tva: Number(d.tva || 19),
     }));
-    const numero = 'BC-' + String(d.num || '').replace(/^D-/, '');
     const html = renderInvoiceHtml({
       docType: 'BON DE COMMANDE', numero, refDevis: d.num, date: d.date, client, lignes,
       ht: tot.ht, tvaMontant: tot.tva, ttc: tot.ttc, remise: tot.remise, objet: d.titre || '',
-      modePaiement: '', validite: '',
+      modePaiement: d.modePaiement || 'chèque', validite: d.validite || '',
+      embed: url.searchParams.get('embed') === '1',
+    });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(html);
+  }
+
+  /* ---------- IMPRESSION FACTURE PROFORMA (depuis un devis) ---------- */
+  if (parts[0] === 'api' && parts[1] === 'devis' && parts[3] === 'proforma' && method === 'GET') {
+    if (!canModule(me, 'devis')) return send(res, 403, { error: 'Accès non autorisé' });
+    const d = (await getDevis(parts[2]));
+    if (!d) return send(res, 404, { error: 'Devis introuvable' });
+    const numero = (await ensureDocNumber(d, 'devis', 'proformaNum', 'PF'));
+    const tot = devisTotal(d);
+    const client = (await db.prepare('SELECT * FROM clients WHERE id = ?').get(d.clientId)) || {};
+    const lignes = (d.lignes || []).map((l) => ({
+      designation: l.description, unite: 'U', quantite: Number(l.qty || 0),
+      pu: Number(l.pu || 0), montant: Number(l.qty || 0) * Number(l.pu || 0), tva: Number(d.tva || 19),
+    }));
+    const html = renderInvoiceHtml({
+      docType: 'FACTURE PROFORMA', numero, refDevis: d.num, date: d.date, client, lignes,
+      ht: tot.ht, tvaMontant: tot.tva, ttc: tot.ttc, remise: tot.remise, objet: d.titre || '',
+      modePaiement: d.modePaiement || 'chèque', validite: d.validite || '',
+      embed: url.searchParams.get('embed') === '1',
+    });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(html);
+  }
+
+  /* ---------- IMPRESSION BON DE LIVRAISON (depuis une facture) ---------- */
+  if (parts[0] === 'api' && parts[1] === 'factures' && parts[3] === 'bon-livraison' && method === 'GET') {
+    if (!canModule(me, 'factures')) return send(res, 403, { error: 'Accès non autorisé' });
+    const f = (await db.prepare('SELECT * FROM factures WHERE id = ?').get(parts[2]));
+    if (!f) return send(res, 404, { error: 'Facture introuvable' });
+    const numero = (await ensureDocNumber(f, 'factures', 'blNum', 'BL'));
+    const data = (await factureDocData(f));
+    const html = renderInvoiceHtml({
+      docType: 'BON DE LIVRAISON', numero, date: f.date, client: data.client,
+      lignes: data.lignes, ht: data.ht, tvaMontant: data.tvaMontant, ttc: data.ttc, remise: data.remise,
+      objet: f.objet || '', modePaiement: f.modePaiement || '', validite: '',
+      embed: url.searchParams.get('embed') === '1',
     });
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end(html);
